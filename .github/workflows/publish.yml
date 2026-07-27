@@ -1,0 +1,60 @@
+# Publish to npm with provenance, using trusted publishing (OIDC).
+#
+# No npm token is stored anywhere. npm's trusted publishing exchanges this
+# workflow's OIDC identity for short-lived credentials and attaches a provenance
+# attestation automatically, so the published package carries a publicly
+# verifiable link back to the exact commit it was built from.
+#
+# That matters more here than for an ordinary package: this tool runs on other
+# people's machines via npx, and its entire argument is "don't trust, verify".
+# Shipping a verification tool that nobody can verify would be the wrong lesson.
+#
+# One-time setup on npmjs.com: Package settings -> Trusted publisher ->
+# GitHub Actions, with this repository and this workflow filename.
+#
+# Release: push a tag like v0.1.0 matching the version in package.json.
+
+name: publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  # Required for trusted publishing: it is what proves to npm which workflow,
+  # in which repository, at which commit is asking to publish.
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      # Provenance requires a recent npm; the runner's bundled version is not
+      # guaranteed to be new enough.
+      - run: npm install -g npm@latest
+
+      # No dependencies to install: the tool has none on purpose, so there is
+      # nothing here that could substitute code between the tag and the publish.
+      - run: npm test
+
+      # The tag and the manifest must agree, or a release can quietly publish a
+      # version nobody tagged.
+      - name: Tag must match package version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "tag $TAG does not match package.json $PKG"
+            exit 1
+          fi
+
+      - run: npm publish

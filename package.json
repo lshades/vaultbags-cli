@@ -1,0 +1,43 @@
+{
+  "name": "vaultbags-cli",
+  "version": "0.1.0",
+  "description": "Read the VaultBags treasury and check it against the chain. Recomputes payouts, decisions and monthly books on your machine and reads the anchor off Solana. Never signs, never accepts a private key.",
+  "type": "module",
+  "bin": {
+    "vaultbags": "bin/vaultbags.js"
+  },
+  "exports": {
+    "./canonical": "./src/canonical.js",
+    "./keyguard": "./src/keyguard.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lshades/vaultbags-cli.git"
+  },
+  "homepage": "https://vaultbags.app",
+  "bugs": {
+    "url": "https://github.com/lshades/vaultbags-cli/issues"
+  },
+  "keywords": [
+    "vaultbags",
+    "solana",
+    "rwa",
+    "proof-of-reserves",
+    "merkle",
+    "verification",
+    "cli"
+  ],
+  "license": "MIT"
+}
