@@ -391,3 +391,52 @@ export async function verifyReport(period, opts) {
   });
   return { verdict: selfOk ? anchor : VERDICT.FAILED, checks, extra: { period: monthPeriod } };
 }
+
+
+// The most recent stamped day of claims, verified end to end without needing a
+// transaction signature in hand: rebuild the day's root from the published
+// leaves, compare it with the stamped one, then check the anchor and who
+// signed it. This is what lets `verify all` cover the claim ledger.
+export async function verifyLatestDay(opts) {
+  const checks = [];
+  const idx = await apiGet("/api/proof/claims", opts);
+  const latest = (idx?.roots || [])[0];
+  if (!latest?.period) {
+    return {
+      verdict: VERDICT.UNRESOLVED,
+      checks: [check("a stamped day exists", "unresolved", "no stamped periods are published yet")],
+    };
+  }
+
+  const day = await apiGet(`/api/proof/claims/${encodeURIComponent(latest.period)}`, opts);
+  const rebuilt = buildRoot(day.leaves || []);
+  const rootOk = rebuilt != null && rebuilt === day.root;
+  checks.push(
+    check(
+      `day ${day.period}: root rebuilt here from all ${day.claimCount ?? "?"} claims`,
+      rootOk ? "ok" : "fail",
+      rootOk ? null : `rebuilt ${rebuilt}`
+    )
+  );
+
+  if (!day.stamped || !day.receiptTx) {
+    checks.push(check("anchor on-chain", "pending", "this day is not stamped yet"));
+    return { verdict: rootOk ? VERDICT.NO_ANCHOR : VERDICT.FAILED, checks, extra: { period: day.period } };
+  }
+
+  const anchor = await checkAnchor(checks, {
+    receiptTx: day.receiptTx,
+    expectedHash: rebuilt,
+    expectedSigner: day.expectedSigner ?? null,
+  });
+  return { verdict: rootOk ? anchor : VERDICT.FAILED, checks, extra: { period: day.period } };
+}
+
+// The first day of the previous UTC month: the most recent month whose books
+// can already be closed. Computed in UTC on purpose, because the reports are.
+export function latestClosedMonth(now = new Date()) {
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth();
+  const prev = new Date(Date.UTC(y, m - 1, 1));
+  return prev.toISOString().slice(0, 10);
+}

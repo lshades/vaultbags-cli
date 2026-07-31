@@ -13,7 +13,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { refuseSecretArgs, warnSecretEnv, REFUSAL_ADVICE } from "../src/keyguard.js";
-import { verifyClaim, verifyAllocation, verifyReport, verifyReserves, VERDICT } from "../src/verify.js";
+import { verifyClaim, verifyAllocation, verifyReport, verifyReserves, verifyLatestDay, latestClosedMonth, VERDICT } from "../src/verify.js";
 import { apiGet, apiPost, base, rpc, HttpError, DEFAULT_RPC } from "../src/io.js";
 
 const pkg = JSON.parse(
@@ -212,6 +212,83 @@ async function cmdGet(tool, params) {
   return 0;
 }
 
+// verify all: the four checks in one run, for a cron job or a doubter.
+//
+// Each section renders exactly as its standalone command would, so the output
+// teaches the individual commands. The combined verdict is the WORST of the
+// four: one failed check fails the run, one unresolved read keeps it from
+// claiming success. A summary that averaged instead would be a summary that
+// hid things.
+async function cmdVerifyAll(render) {
+  const sections = [
+    ["today's decision", () => verifyAllocation(new Date().toISOString().slice(0, 10), V)],
+    ["latest claims day", () => verifyLatestDay(V)],
+    [`monthly report ${latestClosedMonth()}`, () => verifyReport(latestClosedMonth(), V)],
+    ["reserves", () => verifyReserves(V)],
+  ];
+
+  const results = [];
+  for (const [name, run] of sections) {
+    let result;
+    try {
+      result = await run();
+    } catch (err) {
+      // One section erroring must not stop the others: the whole point of
+      // `all` is a complete picture, including which parts could not answer.
+      result = {
+        verdict: VERDICT.UNRESOLVED,
+        checks: [{ label: "could not run", state: "unresolved", detail: err?.message || String(err) }],
+      };
+    }
+    results.push({ name, result });
+  }
+
+  if (render === printJson) {
+    const codes = results.map(({ result }) => printableCode(result.verdict));
+    console.log(
+      JSON.stringify(
+        {
+          verdict: worstVerdict(results.map((r) => r.result.verdict)),
+          ok: codes.every((c) => c === 0),
+          sections: results.map(({ name, result }) => ({
+            name,
+            verdict: result.verdict,
+            checks: result.checks,
+            ...(result.hint ? { hint: result.hint } : {}),
+          })),
+        },
+        null,
+        2
+      )
+    );
+    return codes.every((c) => c === 0) ? 0 : 1;
+  }
+
+  let code = 0;
+  for (const { name, result } of results) {
+    console.log(c.bold(`
+${name}`));
+    const sectionCode = printChecks(result);
+    if (sectionCode !== 0) code = 1;
+  }
+  return code;
+}
+
+// Exit-code mapping shared with the single commands: verified, not-yet-anchored
+// and partial pass; unresolved and failed do not.
+function printableCode(verdict) {
+  return verdict === VERDICT.VERIFIED || verdict === VERDICT.NO_ANCHOR || verdict === VERDICT.PARTIAL ? 0 : 1;
+}
+
+const VERDICT_RANK = [VERDICT.VERIFIED, VERDICT.NO_ANCHOR, VERDICT.PARTIAL, VERDICT.UNRESOLVED, VERDICT.FAILED];
+function worstVerdict(verdicts) {
+  let worst = VERDICT.VERIFIED;
+  for (const v of verdicts) {
+    if (VERDICT_RANK.indexOf(v) > VERDICT_RANK.indexOf(worst)) worst = v;
+  }
+  return worst;
+}
+
 // --- entry -----------------------------------------------------------------
 
 function usage() {
@@ -224,6 +301,7 @@ ${c.bold("Verify")} (recomputed here, anchor read from Solana)
   verify allocation [date]       what the agent chose to buy, against its receipt
   verify report <YYYY-MM-01>     a month's closed books, against their receipt
   verify reserves                what the vault says it holds, against the chain
+  verify all                     the four checks in one run, worst verdict wins
 
   --json                         any verify command, as machine-readable output
 
@@ -305,6 +383,9 @@ async function main() {
       }
       if (sub === "reserves") {
         return render(await verifyReserves(V));
+      }
+      if (sub === "all") {
+        return cmdVerifyAll(render);
       }
       if (sub === "report") {
         if (!arg) return usageError("verify report needs a month, like 2026-06-01");
