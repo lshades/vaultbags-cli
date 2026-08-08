@@ -225,16 +225,47 @@ export async function getOwnerBalances(owner, programId) {
     // 0.039645 to itself in binary floating point invents digits that were
     // never on the chain, and a tool whose whole claim is exactness must not
     // print an amount the ledger does not contain.
-    const raw = info?.tokenAmount?.amount;
     const decimals = info?.tokenAmount?.decimals;
-    if (!mint || typeof raw !== "string" || !/^\d+$/.test(raw)) continue;
+    // uiAmountString, not `amount`. For most tokens they say the same thing,
+    // and for one of the assets held here they do not: it carries the
+    // scaled-ui-amount extension, where a multiplier sits between the stored
+    // integer and the balance, and grows as the underlying pays out. Reading
+    // the integer and dividing by the decimals therefore reports a real holding
+    // as smaller than it is, which on a reserves check looks like the vault is
+    // short. The chain already does that arithmetic and hands back the answer;
+    // taking it is both simpler and correct for every extension, including ones
+    // that do not exist yet.
+    //
+    // Still summed as whole units, never as decimals: the string is parsed into
+    // the token's own smallest unit and added there, because a tool whose whole
+    // claim is exactness must not print an amount that floating point invented.
+    const ui = info?.tokenAmount?.uiAmountString;
+    if (!mint || typeof ui !== "string" || !Number.isInteger(decimals)) continue;
+    const scaled = parseUnits(ui, decimals);
+    if (scaled === null) continue;
     const prev = totals.get(mint);
     totals.set(mint, {
-      raw: (prev?.raw ?? 0n) + BigInt(raw),
+      raw: (prev?.raw ?? 0n) + scaled,
       decimals: prev?.decimals ?? decimals,
     });
   }
   return { totals };
+}
+
+// A decimal amount as the exact integer of the token's smallest unit. Returns
+// null on anything it cannot read exactly, so a malformed answer is skipped
+// rather than guessed at.
+export function parseUnits(str, decimals) {
+  const s = String(str ?? "").trim();
+  if (!/^\d+(\.\d*)?$/.test(s)) return null;
+  const d = Number.isInteger(decimals) && decimals >= 0 ? decimals : 0;
+  const [whole, frac = ""] = s.split(".");
+  if (frac.length > d) return null; // more precision than the token has
+  try {
+    return BigInt(whole + frac.padEnd(d, "0"));
+  } catch {
+    return null;
+  }
 }
 
 // A whole-unit amount as the exact decimal it is, with no trailing noise.

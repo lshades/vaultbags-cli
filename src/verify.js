@@ -358,6 +358,20 @@ export async function verifyReserves(opts) {
     );
   }
 
+  // The moment the published figures describe. Comparing two chain reads without
+  // it is comparing two unnamed instants, which is how a few seconds of drift
+  // and a real gap end up looking the same. With it, a difference has somewhere
+  // to come from.
+  if (Number.isFinite(Number(d.slot))) {
+    checks.push(
+      check(
+        `published figures read at slot ${d.slot}${Number.isFinite(Number(d.accountsRead)) ? ` across ${d.accountsRead} accounts` : ""}`,
+        "ok",
+        "this reading is later, so small differences above are the chain moving on"
+      )
+    );
+  }
+
   if (failed) return { verdict: VERDICT.FAILED, checks };
   if (unresolved) {
     return {
