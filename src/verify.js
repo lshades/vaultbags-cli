@@ -329,7 +329,19 @@ export async function verifyReserves(opts) {
       // At or above the headline: nothing is being overstated, which is the
       // claim that matters. Holding more is not an alarm; assets arrive
       // continuously and a headline is a moment in time.
-      checks.push(check(`${r.name}: ${shown} on-chain against ${published} published`, "ok"));
+      //
+      // When the two numbers differ, say why this still passed. A verification
+      // tool that prints two different figures and calls them ok is asking the
+      // reader to work out the rule for themselves, and a reader who cannot see
+      // the rule cannot tell a tolerated gap from an unnoticed one. Identical
+      // figures need no explanation and get none.
+      const matches = gapShown === "0";
+      const note = matches
+        ? null
+        : gap > 0
+          ? `holding ${gapShown} more than the headline`
+          : `short by ${gapShown}, inside the ${(RESERVE_TOLERANCE * 100).toFixed(0)}% tolerance`;
+      checks.push(check(`${r.name}: ${shown} on-chain against ${published} published`, "ok", note));
       continue;
     }
 
@@ -338,7 +350,11 @@ export async function verifyReserves(opts) {
     // finding rather than a caveat.
     failed = true;
     checks.push(
-      check(`${r.name}: ${shown} on-chain against ${published} published`, "fail", `short by ${gapShown}`)
+      check(
+        `${r.name}: ${shown} on-chain against ${published} published`,
+        "fail",
+        `short by ${gapShown}, past the ${(RESERVE_TOLERANCE * 100).toFixed(0)}% tolerance`
+      )
     );
   }
 
