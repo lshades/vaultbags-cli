@@ -20,7 +20,7 @@ import {
   monthlyPayload,
   hashFromMemo,
 } from "./canonical.js";
-import { apiGet, getTransaction, getMintPrograms, getOwnerBalances, formatUnits } from "./io.js";
+import { apiGet, getTransaction, getSignatureStatuses, getMintPrograms, getOwnerBalances, formatUnits } from "./io.js";
 
 export const VERDICT = {
   VERIFIED: "verified",
@@ -426,6 +426,103 @@ export async function verifyReport(period, opts) {
 // The most recent stamped day of claims, verified end to end without needing a
 // transaction signature in hand: rebuild the day's root from the published
 // leaves, compare it with the stamped one, then check the anchor and who
+// Did a day's payouts actually land? Asked of YOUR node, not of the protocol.
+//
+// `verify claim` proves one payout is inside the day's anchored root, and
+// `verify allocation` proves a decision matches its receipt. Neither asks the
+// question a holder actually cares about: did the transfer go through. A payout
+// can sit in a perfectly valid Merkle tree and still name a transaction the
+// chain rejected, and no proof in this tool would notice.
+//
+// So this takes the day's published claim set, pulls the signature out of each
+// record, and asks the chain for the status of every one. The protocol reports
+// its own count at /api/agent/payout-integrity; this deliberately does not use
+// it, because a verifier that accepts the answer it was sent has verified
+// nothing. Point VB_RPC at your own node and not one byte of the verdict comes
+// from us.
+//
+// A signature the node does not carry is UNRESOLVED, never a failure. Nodes
+// prune history, and reporting "your payout failed" because a node forgot it
+// would be the worst kind of false alarm this tool could raise.
+export async function verifyPayouts(period, opts) {
+  const checks = [];
+
+  let day;
+  if (period) {
+    day = await apiGet(`/api/proof/claims/${encodeURIComponent(period)}`, opts);
+  } else {
+    const idx = await apiGet("/api/proof/claims", opts);
+    const latest = (idx?.roots || [])[0];
+    if (!latest?.period) {
+      return {
+        verdict: VERDICT.UNRESOLVED,
+        checks: [check("a published day exists", "unresolved", "no periods are published yet")],
+      };
+    }
+    day = await apiGet(`/api/proof/claims/${encodeURIComponent(latest.period)}`, opts);
+  }
+
+  const leaves = day?.leaves || [];
+  const signatures = leaves.map((l) => l?.tx).filter((t) => typeof t === "string" && t.length > 0);
+
+  if (!leaves.length) {
+    return {
+      verdict: VERDICT.UNRESOLVED,
+      checks: [check(`day ${day?.period || period}: payouts to check`, "unresolved", "no payouts are published for that day")],
+    };
+  }
+  if (signatures.length !== leaves.length) {
+    checks.push(
+      check(
+        `${leaves.length - signatures.length} of ${leaves.length} records carry no transaction`,
+        "unresolved",
+        "a record with no signature cannot be checked against anything"
+      )
+    );
+  }
+
+  let statuses;
+  try {
+    statuses = await getSignatureStatuses(signatures);
+  } catch (err) {
+    return {
+      verdict: VERDICT.UNRESOLVED,
+      checks: [check("the chain answered", "unresolved", err?.message || String(err))],
+    };
+  }
+
+  const failed = statuses.filter((st) => st.known && st.failed).length;
+  const unknown = statuses.filter((st) => !st.known).length;
+  const landed = statuses.length - failed - unknown;
+
+  checks.push(
+    check(
+      `day ${day.period}: ${landed} of ${signatures.length} payouts confirmed by the chain`,
+      failed > 0 ? "fail" : unknown > 0 ? "unresolved" : "ok",
+      failed > 0 ? `${failed} recorded as paid but rejected on-chain` : null
+    )
+  );
+  if (unknown > 0) {
+    checks.push(
+      check(
+        `${unknown} not carried by this node`,
+        "unresolved",
+        "the node has pruned them from its history; this says nothing about the payout"
+      )
+    );
+  }
+
+  const incomplete = signatures.length !== leaves.length;
+  const verdict =
+    failed > 0
+      ? VERDICT.FAILED
+      : unknown > 0 || incomplete
+        ? VERDICT.UNRESOLVED
+        : VERDICT.VERIFIED;
+
+  return { verdict, checks };
+}
+
 // signed it. This is what lets `verify all` cover the claim ledger.
 export async function verifyLatestDay(opts) {
   const checks = [];

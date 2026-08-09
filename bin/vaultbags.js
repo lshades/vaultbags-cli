@@ -13,7 +13,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { refuseSecretArgs, warnSecretEnv, REFUSAL_ADVICE } from "../src/keyguard.js";
-import { verifyClaim, verifyAllocation, verifyReport, verifyReserves, verifyLatestDay, latestClosedMonth, VERDICT } from "../src/verify.js";
+import { verifyClaim, verifyAllocation, verifyReport, verifyReserves, verifyLatestDay, verifyPayouts, latestClosedMonth, VERDICT } from "../src/verify.js";
 import { apiGet, apiPost, base, rpc, HttpError, DEFAULT_RPC } from "../src/io.js";
 
 const pkg = JSON.parse(
@@ -212,7 +212,7 @@ async function cmdGet(tool, params) {
   return 0;
 }
 
-// verify all: the four checks in one run, for a cron job or a doubter.
+// verify all: the five checks in one run, for a cron job or a doubter.
 //
 // Each section renders exactly as its standalone command would, so the output
 // teaches the individual commands. The combined verdict is the WORST of the
@@ -223,6 +223,11 @@ async function cmdVerifyAll(render) {
   const sections = [
     ["today's decision", () => verifyAllocation(new Date().toISOString().slice(0, 10), V)],
     ["latest claims day", () => verifyLatestDay(V)],
+    // Distinct from the line above on purpose. That one proves the day's
+    // records are the ones anchored on-chain; this one proves the transfers
+    // those records name actually went through. A payout can sit in a perfectly
+    // valid tree and still name a transaction the chain rejected.
+    ["latest day's payouts landed", () => verifyPayouts(null, V)],
     [`monthly report ${latestClosedMonth()}`, () => verifyReport(latestClosedMonth(), V)],
     ["reserves", () => verifyReserves(V)],
   ];
@@ -301,7 +306,8 @@ ${c.bold("Verify")} (recomputed here, anchor read from Solana)
   verify allocation [date]       what the agent chose to buy, against its receipt
   verify report <YYYY-MM-01>     a month's closed books, against their receipt
   verify reserves                what the vault says it holds, against the chain
-  verify all                     the four checks in one run, worst verdict wins
+  verify payouts [date]          a day's payouts actually landed, asked of the chain
+  verify all                     the five checks in one run, worst verdict wins
 
   --json                         any verify command, as machine-readable output
 
@@ -383,6 +389,10 @@ async function main() {
       }
       if (sub === "reserves") {
         return render(await verifyReserves(V));
+      }
+      if (sub === "payouts") {
+        if (arg && !/^\d{4}-\d{2}-\d{2}$/.test(arg)) return usageError("the date must look like 2026-07-27");
+        return render(await verifyPayouts(arg || null, V));
       }
       if (sub === "all") {
         return cmdVerifyAll(render);

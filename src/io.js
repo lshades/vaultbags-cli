@@ -280,6 +280,38 @@ export function formatUnits(raw, decimals) {
 // Read a transaction from Solana: the memo it carries and who signed it.
 // Returns null when the RPC does not have it, which is different from a
 // transaction that exists and failed (that comes back with failed: true).
+// The status of many signatures in one call, from the caller's own node.
+//
+// getTransaction pulls a whole transaction to answer a yes-or-no question, and
+// checking a day of payouts one at a time that way is both slow and enough
+// calls to trip a shared endpoint. This asks the one thing that matters.
+//
+// searchTransactionHistory is required: a node's recent-status cache only
+// covers the last couple of days, and payouts older than that would come back
+// absent, which reads as "missing" when it means "not in the cache".
+//
+// null in the returned array means the node does not carry that signature. That
+// is a fact about the node, never a failed payout, and every caller must keep
+// the two apart.
+export async function getSignatureStatuses(signatures) {
+  if (!signatures.length) return [];
+  const out = [];
+  for (let i = 0; i < signatures.length; i += 200) {
+    const batch = signatures.slice(i, i + 200);
+    const { body, status } = await rpcCall("getSignatureStatuses", [batch, { searchTransactionHistory: true }]);
+    if (!body) throw new Error(status ? `RPC responded ${status}` : "RPC could not be reached");
+    if (body.error) throw new Error(`RPC: ${body.error.message}`);
+    const values = body.result?.value;
+    if (!Array.isArray(values) || values.length !== batch.length) {
+      throw new Error("RPC returned a malformed status list");
+    }
+    for (const v of values) {
+      out.push(v == null ? { known: false, failed: false } : { known: true, failed: !!v.err });
+    }
+  }
+  return out;
+}
+
 export async function getTransaction(signature) {
   const { body, status } = await rpcCall("getTransaction", [
     signature,

@@ -26,7 +26,10 @@ vaultbags verify claim <tx>            # a holder payout, against the day's on-c
 vaultbags verify allocation [date]     # what the agent chose to buy, against its receipt
 vaultbags verify report <YYYY-MM-01>   # a month's closed books, against their receipt
 vaultbags verify reserves              # what the vault says it holds, against the chain
+vaultbags verify payouts [date]        # a day's payouts actually landed, asked of the chain
 ```
+
+`verify payouts` is the one that asks the question a holder actually cares about. The other checks prove a record is the one anchored on-chain; a payout can sit in a perfectly valid tree and still name a transaction the chain rejected. This takes the day's published claim set, pulls the signature out of every record and asks the chain the status of each. The protocol publishes its own count of this; the command deliberately does not use it, because a verifier that accepts the answer it was handed has verified nothing.
 
 Add `--json` to any of them for machine-readable output with the same exit codes, so this can sit inside a monitor or a CI step.
 
