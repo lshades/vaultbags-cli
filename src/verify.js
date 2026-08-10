@@ -36,6 +36,41 @@ export const VERDICT = {
 
 const check = (label, state, detail) => ({ label, state, detail: detail || null });
 
+// How much work a remote answer is allowed to ask of your machine.
+//
+// Every one of these commands is handed a list by the side being checked and
+// then does a piece of work per entry: a balance read per wallet, a status
+// lookup per signature, a round trip per transaction, a hash per leaf. That is
+// the right shape for a verifier, and it means the list decides the workload.
+// While the endpoint is honest the lists are small: about a dozen wallets, a
+// few hundred signatures. As an open-ended promise it is something else, since
+// a compromised endpoint could answer with a hundred thousand entries and turn
+// a verification into a long, quiet hammering of whichever node you pointed
+// this at, on your bandwidth and your rate limit.
+//
+// So each list has a ceiling, an order of magnitude above anything real, and
+// what happens at the ceiling is the part that matters: the list is NOT trimmed
+// to fit. A partial pass prints exactly like a full one, and the entry left out
+// is the one a forger would pick. It stops and says the answer was bigger than
+// it will read, which is the only response that stays true.
+const LIMITS = {
+  wallets: 200, // one balance read per wallet, per token program
+  signatures: 5000, // status lookups, sent 200 at a time
+  txReads: 500, // one round trip each, so the tightest of them
+  leaves: 100000, // hashed in memory rather than fetched, but still not endless
+};
+
+const tooLarge = (what, n, cap) => ({
+  verdict: VERDICT.UNRESOLVED,
+  checks: [
+    check(
+      `the answer names ${n} ${what}, more than this command will read (${cap})`,
+      "unresolved",
+      "it is not checked in part: a partial pass over an answer that size would report as though it covered all of it"
+    ),
+  ],
+});
+
 // "0.00292100" -> "0.002921", and "1.000" -> "1". Display only.
 const trimZeros = (s) => (s.includes(".") ? s.replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "") : s);
 
@@ -122,7 +157,9 @@ export async function verifyClaim(tx, opts) {
   // Rebuilding the whole day from the published set is what catches a claim
   // that was quietly dropped from the tree rather than altered inside it.
   const day = await apiGet(`/api/proof/claims/${encodeURIComponent(claim.period)}`, opts);
-  const rebuilt = buildRoot(day.leaves || []);
+  const dayLeaves = day.leaves || [];
+  if (dayLeaves.length > LIMITS.leaves) return tooLarge("claims", dayLeaves.length, LIMITS.leaves);
+  const rebuilt = buildRoot(dayLeaves);
   const rootOk = rebuilt === claim.root;
   checks.push(
     check(
@@ -245,6 +282,8 @@ export async function verifyReserves(opts) {
       checks: [check("reserves are published", "unresolved", "nothing to verify in the response")],
     };
   }
+
+  if (wallets.length > LIMITS.wallets) return tooLarge("reserve wallets", wallets.length, LIMITS.wallets);
   checks.push(
     check(
       `${wallets.length} reserve wallets across the protocol, read directly from Solana`,
@@ -465,6 +504,8 @@ export async function verifyPayouts(period, opts) {
   const leaves = day?.leaves || [];
   const signatures = leaves.map((l) => l?.tx).filter((t) => typeof t === "string" && t.length > 0);
 
+  if (leaves.length > LIMITS.signatures) return tooLarge("payouts", leaves.length, LIMITS.signatures);
+
   if (!leaves.length) {
     return {
       verdict: VERDICT.UNRESOLVED,
@@ -545,16 +586,6 @@ export async function verifyPayouts(period, opts) {
 // exactly the unchecked one be the fabricated one.
 const LOCK_INSTRUCTION = "PermanentLockPosition";
 
-// How much remote-supplied work this command will do against YOUR node.
-//
-// Every transaction read here is named by the API, so the API decides how much
-// work your node is asked to do. Today the record names about 150; these sit an
-// order of magnitude above that, so an honest record never meets them. A record
-// that does is not sampled down to fit: sampling is how the unchecked one gets
-// to be the fabricated one. It stops and says so, which is the only answer that
-// stays true.
-const MAX_SIGNATURES = 5000;
-const MAX_LOCK_READS = 500;
 
 export async function verifyLiquidity(opts) {
   const checks = [];
@@ -607,18 +638,9 @@ export async function verifyLiquidity(opts) {
   const addSigs = deposits.map((d) => d?.addTx).filter((t) => typeof t === "string" && t);
   const lockSigs = [...new Set(deposits.map((d) => d?.lockTx).filter((t) => typeof t === "string" && t))];
 
-  if (addSigs.length + lockSigs.length > MAX_SIGNATURES || lockSigs.length > MAX_LOCK_READS) {
-    return {
-      verdict: VERDICT.UNRESOLVED,
-      checks: [
-        check(
-          `the record names ${addSigs.length + lockSigs.length} transactions, more than this command will read`,
-          "unresolved",
-          "it is not checked in part: a partial pass over a record this size would report as though it covered all of it"
-        ),
-      ],
-    };
-  }
+  const totalSigs = addSigs.length + lockSigs.length;
+  if (totalSigs > LIMITS.signatures) return tooLarge("transactions", totalSigs, LIMITS.signatures);
+  if (lockSigs.length > LIMITS.txReads) return tooLarge("locks to read", lockSigs.length, LIMITS.txReads);
 
   let statuses;
   try {
@@ -738,7 +760,9 @@ export async function verifyLatestDay(opts) {
   }
 
   const day = await apiGet(`/api/proof/claims/${encodeURIComponent(latest.period)}`, opts);
-  const rebuilt = buildRoot(day.leaves || []);
+  const dayLeaves = day.leaves || [];
+  if (dayLeaves.length > LIMITS.leaves) return tooLarge("claims", dayLeaves.length, LIMITS.leaves);
+  const rebuilt = buildRoot(dayLeaves);
   const rootOk = rebuilt != null && rebuilt === day.root;
   checks.push(
     check(
