@@ -27,9 +27,12 @@ vaultbags verify allocation [date]     # what the agent chose to buy, against it
 vaultbags verify report <YYYY-MM-01>   # a month's closed books, against their receipt
 vaultbags verify reserves              # what the vault says it holds, against the chain
 vaultbags verify payouts [date]        # a day's payouts actually landed, asked of the chain
+vaultbags verify liquidity             # the protocol's own liquidity was added and locked on-chain
 ```
 
 `verify payouts` is the one that asks the question a holder actually cares about. The other checks prove a record is the one anchored on-chain; a payout can sit in a perfectly valid tree and still name a transaction the chain rejected. This takes the day's published claim set, pulls the signature out of every record and asks the chain the status of each. The protocol publishes its own count of this; the command deliberately does not use it, because a verifier that accepts the answer it was handed has verified nothing.
+
+`verify liquidity` answers the question asked of every token: whether the people behind it can pull the floor out. It takes the protocol's published liquidity record, and asks the chain about every transaction in it: that each deposit happened and was accepted, that each lock RAN the instruction that makes a position permanent rather than merely existing, and that all of them were signed by the wallet the record names. It comes back partly-verified on purpose. Whether the position holds withdrawable liquidity at this instant is a live account read that needs the pool program's layout, which this tool does not carry, so that one figure is shown as the protocol's own word and is deliberately not folded into the verdict. A verifier that counted someone else's assertion as its own pass would be worth less than no verifier.
 
 Add `--json` to any of them for machine-readable output with the same exit codes, so this can sit inside a monitor or a CI step.
 

@@ -337,5 +337,14 @@ export async function getTransaction(signature) {
     .filter((k) => k.signer)
     .map((k) => k.pubkey);
 
-  return { memo, signers, failed: !!tx.meta?.err, slot: tx.slot ?? null };
+  // The names of the instructions the transaction actually RAN, as the programs
+  // themselves logged them. A caller checking that a specific operation happened
+  // needs this: that a signature exists and succeeded says only that SOMETHING
+  // succeeded, which is a far weaker claim than the one usually made about it.
+  const instructions = logs
+    .map((line) => (typeof line === "string" ? line.match(/Instruction: (\w+)/) : null))
+    .filter(Boolean)
+    .map((m) => m[1]);
+
+  return { memo, signers, instructions, failed: !!tx.meta?.err, slot: tx.slot ?? null };
 }

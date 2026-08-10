@@ -523,6 +523,184 @@ export async function verifyPayouts(period, opts) {
   return { verdict, checks };
 }
 
+// The protocol's own liquidity, checked against the chain.
+//
+// The claim being tested is the one that matters most to anyone deciding
+// whether to touch a token: that the liquidity cannot be pulled. Three separate
+// things are asked of the chain, and none of them is taken from the API:
+//
+//   1. every deposit the record names really happened and was accepted
+//   2. every lock the record names really RAN, by reading the instruction the
+//      transaction executed rather than settling for its existence
+//   3. those transactions are signed by the wallet the record says built it
+//
+// What is NOT proven here is stated rather than glossed: whether the position
+// holds withdrawable liquidity RIGHT NOW is a live account read that needs the
+// pool program's account layout, which this tool does not carry. That figure is
+// reported as the API's, labelled as such, and the verdict is PARTIAL when the
+// rest holds. A verifier that quietly folded someone else's assertion into its
+// own verdict would be worth less than no verifier.
+//
+// Lock instructions are read in full, not sampled: a sampled check would let
+// exactly the unchecked one be the fabricated one.
+const LOCK_INSTRUCTION = "PermanentLockPosition";
+
+export async function verifyLiquidity(opts) {
+  const checks = [];
+
+  let record;
+  try {
+    record = await apiGet("/api/liquidity", opts);
+  } catch (err) {
+    return {
+      verdict: VERDICT.UNRESOLVED,
+      checks: [check("the liquidity record could be read", "unresolved", err?.message || String(err))],
+    };
+  }
+
+  if (!record?.available) {
+    return {
+      verdict: VERDICT.UNRESOLVED,
+      checks: [
+        check(
+          "a complete liquidity record is published",
+          "unresolved",
+          "the record is rebuilt from the chain on each read and was not available; no partial version is served"
+        ),
+      ],
+    };
+  }
+
+  const deposits = Array.isArray(record.deposits) ? record.deposits : [];
+  const wallet = typeof record.wallet === "string" ? record.wallet : null;
+
+  if (!deposits.length) {
+    return {
+      verdict: VERDICT.UNRESOLVED,
+      checks: [check("deposits to check", "unresolved", "the record names none")],
+    };
+  }
+
+  // A record that walked only part of the wallet's history describes part of the
+  // story, and a total over part of a history reads as a total.
+  if (record.complete === false) {
+    checks.push(
+      check(
+        "the record covers the whole history",
+        "unresolved",
+        "the walk behind it hit its page ceiling, so what follows is a floor rather than a total"
+      )
+    );
+  }
+
+  const addSigs = deposits.map((d) => d?.addTx).filter((t) => typeof t === "string" && t);
+  const lockSigs = [...new Set(deposits.map((d) => d?.lockTx).filter((t) => typeof t === "string" && t))];
+
+  let statuses;
+  try {
+    statuses = await getSignatureStatuses([...addSigs, ...lockSigs]);
+  } catch (err) {
+    return {
+      verdict: VERDICT.UNRESOLVED,
+      checks: [check("the chain answered", "unresolved", err?.message || String(err))],
+    };
+  }
+
+  const failed = statuses.filter((st) => st.known && st.failed).length;
+  const unknown = statuses.filter((st) => !st.known).length;
+  const landed = statuses.length - failed - unknown;
+
+  checks.push(
+    check(
+      `${landed} of ${statuses.length} liquidity transactions confirmed by the chain`,
+      failed > 0 ? "fail" : unknown > 0 ? "unresolved" : "ok",
+      failed > 0 ? `${failed} named by the record but rejected on-chain` : null
+    )
+  );
+  if (unknown > 0) {
+    checks.push(
+      check(
+        `${unknown} not carried by this node`,
+        "unresolved",
+        "the node has pruned them from its history; this says nothing about the deposit"
+      )
+    );
+  }
+
+  // Existing is not the same as having run. Read what each lock transaction
+  // actually executed.
+  let locksRan = 0;
+  let lockSignerOk = true;
+  let lockReadFailed = 0;
+  for (const sig of lockSigs) {
+    let tx;
+    try {
+      tx = await getTransaction(sig);
+    } catch {
+      lockReadFailed += 1;
+      continue;
+    }
+    if (!tx) {
+      lockReadFailed += 1;
+      continue;
+    }
+    if ((tx.instructions || []).includes(LOCK_INSTRUCTION)) locksRan += 1;
+    if (wallet && !(tx.signers || []).includes(wallet)) lockSignerOk = false;
+  }
+
+  if (lockSigs.length) {
+    checks.push(
+      check(
+        `${locksRan} of ${lockSigs.length} lock transactions executed ${LOCK_INSTRUCTION}`,
+        locksRan === lockSigs.length ? "ok" : lockReadFailed > 0 ? "unresolved" : "fail",
+        locksRan === lockSigs.length
+          ? null
+          : lockReadFailed > 0
+            ? `${lockReadFailed} could not be read from this node`
+            : "a transaction exists but did not run the instruction that makes a position permanent"
+      )
+    );
+    if (wallet) {
+      checks.push(
+        check(
+          `every lock was signed by ${wallet.slice(0, 6)}...${wallet.slice(-4)}`,
+          lockSignerOk ? "ok" : "fail",
+          lockSignerOk ? null : "a lock the record attributes to that wallet was signed by someone else"
+        )
+      );
+    }
+  }
+
+  // Reported, never folded into the verdict: this one is the API's word.
+  const allLocked = record?.lock?.allLocked;
+  const unlocked = record?.lock?.unlockedLiquidity;
+  checks.push(
+    check(
+      allLocked === true
+        ? "the position reports no withdrawable liquidity"
+        : "the position's current lock state",
+      "note",
+      allLocked === true
+        ? `unlocked liquidity ${unlocked ?? "0"}, read live from the pool by the API and not re-derived here`
+        : "not asserted by this run"
+    )
+  );
+
+  const anythingUnresolved =
+    unknown > 0 || lockReadFailed > 0 || record.complete === false || addSigs.length !== deposits.length;
+
+  const verdict =
+    failed > 0 || !lockSignerOk || (lockSigs.length > 0 && locksRan < lockSigs.length && lockReadFailed === 0)
+      ? VERDICT.FAILED
+      : anythingUnresolved
+        ? VERDICT.UNRESOLVED
+        : // Everything public data can prove held. What it cannot prove is named
+          // above rather than counted as proven.
+          VERDICT.PARTIAL;
+
+  return { verdict, checks };
+}
+
 // signed it. This is what lets `verify all` cover the claim ledger.
 export async function verifyLatestDay(opts) {
   const checks = [];

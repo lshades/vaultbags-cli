@@ -13,7 +13,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { refuseSecretArgs, warnSecretEnv, REFUSAL_ADVICE } from "../src/keyguard.js";
-import { verifyClaim, verifyAllocation, verifyReport, verifyReserves, verifyLatestDay, verifyPayouts, latestClosedMonth, VERDICT } from "../src/verify.js";
+import { verifyClaim, verifyAllocation, verifyReport, verifyReserves, verifyLatestDay, verifyPayouts,
+  verifyLiquidity, latestClosedMonth, VERDICT } from "../src/verify.js";
 import { apiGet, apiPost, base, rpc, HttpError, DEFAULT_RPC } from "../src/io.js";
 
 const pkg = JSON.parse(
@@ -307,7 +308,9 @@ ${c.bold("Verify")} (recomputed here, anchor read from Solana)
   verify report <YYYY-MM-01>     a month's closed books, against their receipt
   verify reserves                what the vault says it holds, against the chain
   verify payouts [date]          a day's payouts actually landed, asked of the chain
-  verify all                     the five checks in one run, worst verdict wins
+  verify liquidity               the protocol's own liquidity was added and locked on-chain
+  verify all                     the five ledger checks in one run, worst verdict wins
+                                 (not liquidity: its verdict is partly-verified by design)
 
   --json                         any verify command, as machine-readable output
 
@@ -389,6 +392,9 @@ async function main() {
       }
       if (sub === "reserves") {
         return render(await verifyReserves(V));
+      }
+      if (sub === "liquidity") {
+        return render(await verifyLiquidity(V), "liquidity");
       }
       if (sub === "payouts") {
         if (arg && !/^\d{4}-\d{2}-\d{2}$/.test(arg)) return usageError("the date must look like 2026-07-27");
