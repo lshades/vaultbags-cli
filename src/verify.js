@@ -545,6 +545,17 @@ export async function verifyPayouts(period, opts) {
 // exactly the unchecked one be the fabricated one.
 const LOCK_INSTRUCTION = "PermanentLockPosition";
 
+// How much remote-supplied work this command will do against YOUR node.
+//
+// Every transaction read here is named by the API, so the API decides how much
+// work your node is asked to do. Today the record names about 150; these sit an
+// order of magnitude above that, so an honest record never meets them. A record
+// that does is not sampled down to fit: sampling is how the unchecked one gets
+// to be the fabricated one. It stops and says so, which is the only answer that
+// stays true.
+const MAX_SIGNATURES = 5000;
+const MAX_LOCK_READS = 500;
+
 export async function verifyLiquidity(opts) {
   const checks = [];
 
@@ -595,6 +606,19 @@ export async function verifyLiquidity(opts) {
 
   const addSigs = deposits.map((d) => d?.addTx).filter((t) => typeof t === "string" && t);
   const lockSigs = [...new Set(deposits.map((d) => d?.lockTx).filter((t) => typeof t === "string" && t))];
+
+  if (addSigs.length + lockSigs.length > MAX_SIGNATURES || lockSigs.length > MAX_LOCK_READS) {
+    return {
+      verdict: VERDICT.UNRESOLVED,
+      checks: [
+        check(
+          `the record names ${addSigs.length + lockSigs.length} transactions, more than this command will read`,
+          "unresolved",
+          "it is not checked in part: a partial pass over a record this size would report as though it covered all of it"
+        ),
+      ],
+    };
+  }
 
   let statuses;
   try {
