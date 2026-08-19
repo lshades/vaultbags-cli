@@ -54,7 +54,30 @@ export function canonicalDecimal(input) {
   return neg && out !== "0" ? `-${out}` : out;
 }
 
-export function canonicalLeaf({ wallet, tokenMint, gold, spyx, usdy, tx }) {
+// A leaf carrying `assets` ([{mint, amount}]) is v2: entries sorted by mint
+// (base58 ascending), each `mint=amount`, joined by ",". Unambiguous because
+// "=" and "," cannot appear in base58 or a plain decimal. Anything else is the
+// original v1 trio, byte-identical to always, so every root ever stamped stays
+// reproducible with this one file.
+export function canonicalAssets(assets) {
+  if (!Array.isArray(assets) || assets.length === 0) throw new Error("assets must be a non-empty array");
+  const entries = assets.map((a) => {
+    if (typeof a?.mint !== "string" || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(a.mint)) {
+      throw new Error(`not a base58 mint: ${a?.mint}`);
+    }
+    return { mint: a.mint, amount: canonicalDecimal(a.amount) };
+  });
+  entries.sort((a, b) => (a.mint < b.mint ? -1 : a.mint > b.mint ? 1 : 0));
+  for (let i = 1; i < entries.length; i++) {
+    if (entries[i].mint === entries[i - 1].mint) throw new Error(`duplicate mint ${entries[i].mint}`);
+  }
+  return entries.map((e) => `${e.mint}=${e.amount}`).join(",");
+}
+
+export function canonicalLeaf({ wallet, tokenMint, gold, spyx, usdy, assets, tx }) {
+  if (assets != null) {
+    return ["v2", `w:${wallet}`, `m:${tokenMint}`, `a:${canonicalAssets(assets)}`, `t:${tx}`].join("|");
+  }
   return [
     "v1",
     `w:${wallet}`,
