@@ -17,6 +17,7 @@ import {
   foldProof,
   buildRoot,
   decisionPayload,
+  strategyPayload,
   monthlyPayload,
   hashFromMemo,
 } from "./canonical.js";
@@ -215,6 +216,52 @@ export async function verifyAllocation(date, opts) {
     verdict: selfOk ? anchor : VERDICT.FAILED,
     checks,
     extra: { date: d.date, weights: d.weights, receiptTx: d.receiptTx },
+  };
+}
+
+// One vault strategy's daily pick against its own on-chain receipt. Same
+// discipline as verifyAllocation: the payload is rebuilt here from the named
+// stored fields (raw signed selection, per-mint weights and convictions),
+// hashed by the published rules, and the memo is read from Solana. `id` is a
+// preset name (classic, growth, hard-money, income) or the 64-hex strategy key.
+export async function verifyStrategy(id, date, opts) {
+  const checks = [];
+  const d = await apiGet(
+    `/api/proof/strategy/${encodeURIComponent(date)}/${encodeURIComponent(id)}`,
+    opts
+  );
+  if (d?.error) {
+    return { verdict: VERDICT.FAILED, checks: [check("strategy decision is on record", "fail", d.error)] };
+  }
+
+  const localHash = sha256(canonicalStringify(strategyPayload(d)));
+  const label = d.presetId ? d.presetId : `${(d.strategyKey || "").slice(0, 12)}…`;
+  const weightsLine = Object.entries(d.weights || {})
+    .map(([mint, pct]) => `${mint.slice(0, 4)}… ${pct}%`)
+    .join(" / ");
+  if (!d.stamped) {
+    checks.push(check("strategy decision is on record", "ok", `${d.date} ${label}: ${weightsLine}`));
+    checks.push(
+      check("anchor on-chain", "pending", "this decision is not stamped yet, so there is nothing independent to check")
+    );
+    return { verdict: VERDICT.NO_ANCHOR, checks, extra: { date: d.date, strategyKey: d.strategyKey, localHash } };
+  }
+
+  const selfOk = localHash === d.storedHash;
+  checks.push(
+    check("the published decision hashes to the published digest", selfOk ? "ok" : "fail", selfOk ? null : localHash)
+  );
+
+  const anchor = await checkAnchor(checks, {
+    receiptTx: d.receiptTx,
+    expectedHash: localHash,
+    expectedMemo: d.memoText,
+    expectedSigner: d.expectedSigner,
+  });
+  return {
+    verdict: selfOk ? anchor : VERDICT.FAILED,
+    checks,
+    extra: { date: d.date, strategyKey: d.strategyKey, presetId: d.presetId || null, receiptTx: d.receiptTx },
   };
 }
 

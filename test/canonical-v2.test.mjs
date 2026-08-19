@@ -4,7 +4,7 @@
 // spec cannot drift apart without one suite going red.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { canonicalAssets, canonicalLeaf, hashLeaf } from "../src/canonical.js";
+import { canonicalAssets, canonicalLeaf, hashLeaf, strategyPayload, canonicalStringify, sha256 } from "../src/canonical.js";
 
 const M1 = "1".repeat(32);
 const M2 = "2".repeat(32);
@@ -45,5 +45,26 @@ test("v1 leaf stays byte-identical (no assets key = old path)", () => {
   assert.equal(
     canonicalLeaf(v1),
     `v1|w:${base.wallet}|m:${base.tokenMint}|g:100|s:5.5|u:0|t:${base.tx}`
+  );
+});
+
+// Cross-implementation vector: this hash was produced by the app's own
+// receiptCore (strategyReceiptPayload + receiptHash) over this exact fixture,
+// so the two copies of the strategy-receipt spec cannot drift without this
+// test going red.
+test("strategy payload hashes to the app's reference vector", () => {
+  const d = {
+    date: "2026-08-20",
+    strategyKey: "ab".repeat(32),
+    selection: [
+      { mint: "1".repeat(32), base: 60 },
+      { mint: "2".repeat(32), base: 40 },
+    ],
+    weights: { ["1".repeat(32)]: 55, ["2".repeat(32)]: 45 },
+    convictions: { ["1".repeat(32)]: 0.25, ["2".repeat(32)]: -0.25 },
+  };
+  assert.equal(
+    sha256(canonicalStringify(strategyPayload(d))),
+    "c7f06f664b03e61acad2b46e88174afae26ec86a174c85a0f78b840ab22f1a61"
   );
 });

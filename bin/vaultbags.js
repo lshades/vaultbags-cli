@@ -13,7 +13,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { refuseSecretArgs, warnSecretEnv, REFUSAL_ADVICE } from "../src/keyguard.js";
-import { verifyClaim, verifyAllocation, verifyReport, verifyReserves, verifyLatestDay, verifyPayouts,
+import { verifyClaim, verifyAllocation, verifyStrategy, verifyReport, verifyReserves, verifyLatestDay, verifyPayouts,
   verifyLiquidity, latestClosedMonth, VERDICT } from "../src/verify.js";
 import { apiGet, apiPost, base, rpc, HttpError, DEFAULT_RPC } from "../src/io.js";
 
@@ -305,6 +305,8 @@ function usage() {
 ${c.bold("Verify")} (recomputed here, anchor read from Solana)
   verify claim <tx>              a holder payout, against the day's on-chain root
   verify allocation [date]       what the agent chose to buy, against its receipt
+  verify strategy <id> [date]    one vault strategy's daily pick, against its receipt
+                                 (id: classic, growth, hard-money, income, or a 64-hex key)
   verify report <YYYY-MM-01>     a month's closed books, against their receipt
   verify reserves                what the vault says it holds, against the chain
   verify payouts [date]          a day's payouts actually landed, asked of the chain
@@ -389,6 +391,14 @@ async function main() {
         const date = arg || new Date().toISOString().slice(0, 10);
         if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return usageError("the date must look like 2026-07-27");
         return render(await verifyAllocation(date, V));
+      }
+      if (sub === "strategy") {
+        if (!arg || !/^([a-z][a-z-]{0,31}|[0-9a-f]{64})$/.test(arg)) {
+          return usageError("verify strategy needs a preset (classic, growth, hard-money, income) or a 64-hex key");
+        }
+        const date = words[3] || new Date().toISOString().slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return usageError("the date must look like 2026-07-27");
+        return render(await verifyStrategy(arg, date, V));
       }
       if (sub === "reserves") {
         return render(await verifyReserves(V));

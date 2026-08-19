@@ -138,6 +138,25 @@ export function decisionPayload(d) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-strategy daily decision receipt (Smart Vaults)
+
+// Rebuilt from named fields, same reason as decisionPayload: a server that
+// padded its response gains nothing. `selection` is the raw signed
+// [{mint, base}] list exactly as stored; weights/convictions are keyed by
+// mint. The memo shape is vaultbags:strategy:v1:<date>:<key>:<hash>.
+export function strategyPayload(d) {
+  return {
+    v: 1,
+    kind: "strategy-alloc",
+    date: d?.date,
+    strategy: d?.strategyKey,
+    selection: d?.selection ?? null,
+    weights: d?.weights ?? null,
+    convictions: d?.convictions ?? null,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Monthly report receipt
 
 export function monthlyPayload({ period, metrics }) {
