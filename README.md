@@ -24,6 +24,7 @@ Node 18 or newer. No configuration, no account, no key.
 ```bash
 vaultbags verify claim <tx>            # a holder payout, against the day's on-chain root
 vaultbags verify allocation [date]     # what the agent chose to buy, against its receipt
+vaultbags verify strategy <id> [date]  # one strategy's daily decision, against its receipt
 vaultbags verify report <YYYY-MM-01>   # a month's closed books, against their receipt
 vaultbags verify reserves              # what the vault says it holds, against the chain
 vaultbags verify payouts [date]        # a day's payouts actually landed, asked of the chain
