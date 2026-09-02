@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { refuseSecretArgs, warnSecretEnv, REFUSAL_ADVICE } from "../src/keyguard.js";
 import { verifyClaim, verifyAllocation, verifyStrategy, verifyReport, verifyReserves, verifyLatestDay, verifyPayouts,
-  verifyLiquidity, latestClosedMonth, VERDICT } from "../src/verify.js";
+  verifyLiquidity, verifyReceipt, latestClosedMonth, VERDICT } from "../src/verify.js";
 import { apiGet, apiPost, base, rpc, HttpError, DEFAULT_RPC } from "../src/io.js";
 
 const pkg = JSON.parse(
@@ -193,22 +193,45 @@ async function cmdAsk(question) {
 
 // --- discovery -------------------------------------------------------------
 
+// An operation the spec says can answer 402 is a paid resource. The spec is
+// the source of that fact, so a new paid product is labelled here with no
+// release, exactly as a new free tool is listed with none.
+const isPaidOp = (op) => Boolean(op?.responses && Object.keys(op.responses).includes("402"));
+
 async function cmdTools() {
   const spec = await apiGet("/api/openapi", V);
   const paths = Object.keys(spec?.paths || {}).filter((p) => p.startsWith("/api/agent/"));
   console.log(c.bold(`${paths.length} tools, read live from the spec`));
+  let paid = 0;
   for (const p of paths) {
     const op = spec.paths[p].get || spec.paths[p].post || {};
     const name = p.replace("/api/agent/", "");
-    console.log(`  ${name.padEnd(24)} ${c.dim((op.summary || "").slice(0, 70))}`);
+    const tag = isPaidOp(op) ? c.yellow(" paid") : "";
+    if (tag) paid++;
+    console.log(`  ${name.padEnd(24)} ${c.dim((op.summary || "").slice(0, 70))}${tag}`);
   }
   console.log(c.dim("\n  Any of them: vaultbags get <tool> [--param=value]"));
+  if (paid) console.log(c.dim("  Paid ones answer with their terms; this tool never pays, it never handles keys."));
   return 0;
 }
 
 async function cmdGet(tool, params) {
   const qs = new URLSearchParams(params).toString();
-  const data = await apiGet(`/api/agent/${encodeURIComponent(tool)}${qs ? `?${qs}` : ""}`, V);
+  let data;
+  try {
+    data = await apiGet(`/api/agent/${encodeURIComponent(tool)}${qs ? `?${qs}` : ""}`, V);
+  } catch (err) {
+    // A paid resource called bare answers 402 with its terms. That is the
+    // resource working as designed, not a failure, and telling someone to
+    // upgrade would send them chasing a bug that does not exist.
+    if (err instanceof HttpError && err.status === 402) {
+      console.log(c.yellow(`${tool} is a paid resource.`));
+      console.log(c.dim("  It answers with its payment terms; this tool does not pay, it never handles keys."));
+      console.log(c.dim(`  Read the terms: curl -s ${base()}/api/agent/${encodeURIComponent(tool)}`));
+      return 1;
+    }
+    throw err;
+  }
   console.log(JSON.stringify(data, null, 2));
   return 0;
 }
@@ -311,7 +334,8 @@ ${c.bold("Verify")} (recomputed here, anchor read from Solana)
   verify reserves                what the vault says it holds, against the chain
   verify payouts [date]          a day's payouts actually landed, asked of the chain
   verify liquidity               the protocol's own liquidity was added and locked on-chain
-  verify all                     the five ledger checks in one run, worst verdict wins
+  verify receipt <jwt>           a paid call's signed receipt, then the payment it names, on-chain
+  verify all                    the five ledger checks in one run, worst verdict wins
                                  (not liquidity: its verdict is partly-verified by design)
 
   --json                         any verify command, as machine-readable output
@@ -348,7 +372,17 @@ async function main() {
   const arg = words[2];
   // A claim signature is legitimately long base58; it is the argument of the
   // core command and must not be mistaken for a secret.
-  const signatureArgs = cmd === "verify" && sub === "claim" && arg ? [arg] : [];
+  //
+  // A receipt is exempt only when it has the SHAPE of one: three base64url
+  // parts joined by dots. The guard tests whole arguments, so the dots already
+  // keep a token from matching a key pattern today; naming the shape here pins
+  // that a receipt stays accepted even if the guard ever learns to scan inside
+  // an argument (its 342-character signature part often contains a base58 run
+  // as long as a key). No key has dots, so a key pasted where the receipt goes
+  // is still refused.
+  const JWT_SHAPE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+  const signatureArgs =
+    cmd === "verify" && arg && (sub === "claim" || (sub === "receipt" && JWT_SHAPE.test(arg))) ? [arg] : [];
   // The refusal runs before anything else, including help, so a mistyped paste
   // is caught by the first thing that reads it.
   const refusal = refuseSecretArgs(argv, { signatureArgs });
@@ -409,6 +443,10 @@ async function main() {
       if (sub === "payouts") {
         if (arg && !/^\d{4}-\d{2}-\d{2}$/.test(arg)) return usageError("the date must look like 2026-07-27");
         return render(await verifyPayouts(arg || null, V));
+      }
+      if (sub === "receipt") {
+        if (!arg) return usageError("verify receipt needs the token from a paid call's X-X402-Receipt header");
+        return render(await verifyReceipt(arg, V));
       }
       if (sub === "all") {
         return cmdVerifyAll(render);

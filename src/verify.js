@@ -21,7 +21,8 @@ import {
   monthlyPayload,
   hashFromMemo,
 } from "./canonical.js";
-import { apiGet, getTransaction, getSignatureStatuses, getMintPrograms, getOwnerBalances, formatUnits } from "./io.js";
+import { apiGet, apiGetTerms, getTransaction, getSignatureStatuses, getMintPrograms, getOwnerBalances, formatUnits } from "./io.js";
+import { decodeReceipt, verifyReceiptSignature, checkReceiptClaims } from "./receipt.js";
 
 export const VERDICT = {
   VERIFIED: "verified",
@@ -59,6 +60,7 @@ const LIMITS = {
   signatures: 5000, // status lookups, sent 200 at a time
   txReads: 500, // one round trip each, so the tightest of them
   leaves: 100000, // hashed in memory rather than fetched, but still not endless
+  jwksKeys: 20, // an issuer rotating keys publishes two or three, not hundreds
 };
 
 const tooLarge = (what, n, cap) => ({
@@ -839,4 +841,136 @@ export function latestClosedMonth(now = new Date()) {
   const m = now.getUTCMonth();
   const prev = new Date(Date.UTC(y, m - 1, 1));
   return prev.toISOString().slice(0, 10);
+}
+
+// A paid call's receipt, checked in the order that keeps each step honest.
+//
+// The signature proves who ISSUED the receipt, and the key it is checked
+// against comes from the issuer, so on its own that step proves the token is
+// consistent with vaultbags.app and nothing more. The chain proves the PAYMENT
+// happened: that the transaction the receipt names ran, moved at least the
+// stated amount of the stated asset to the stated wallet, and was signed by the
+// stated payer. That second leg is what earns the word verified, so a receipt
+// whose transaction this node cannot see comes back unresolved, not verified,
+// for the same reason verify payouts does.
+//
+// One more comparison sits between the two: the wallet and asset the vault
+// ADVERTISES for payment, read live from its 402 terms. A validly signed receipt
+// naming some other wallet would be the issuer contradicting itself. When the
+// terms cannot be read (the paid lane is off, or VB_BASE points elsewhere) the
+// verdict is partial, and says which comparison it could not make.
+export async function verifyReceipt(jwt, opts) {
+  const checks = [];
+  const decoded = decodeReceipt(jwt);
+  if (!decoded.ok) {
+    return { verdict: VERDICT.FAILED, checks: [check("the receipt is a well-formed signed token", "fail", decoded.reason)] };
+  }
+  const claims = decoded.claims;
+
+  let jwks;
+  try {
+    jwks = await apiGet("/.well-known/jwks.json", opts);
+  } catch (e) {
+    return { verdict: VERDICT.UNRESOLVED, checks: [check("the issuer's public keys could be read", "unresolved", e.message)] };
+  }
+  const keys = Array.isArray(jwks?.keys) ? jwks.keys : [];
+  if (keys.length > LIMITS.jwksKeys) return tooLarge("keys", keys.length, LIMITS.jwksKeys);
+  if (!keys.length) {
+    return {
+      verdict: VERDICT.UNRESOLVED,
+      checks: [
+        check(
+          "the issuer publishes a signing key",
+          "unresolved",
+          "no key is published right now, so no receipt can be checked against one; the payment itself can still be read by its tx_hash"
+        ),
+      ],
+    };
+  }
+
+  const sig = verifyReceiptSignature(decoded, keys);
+  checks.push(check("signed by the issuer's published key", sig.ok ? "ok" : "fail", sig.ok ? `RS256, key ${sig.kid}` : sig.reason));
+  if (!sig.ok) return { verdict: VERDICT.FAILED, checks };
+
+  let claimsFailed = false;
+  for (const c of checkReceiptClaims(claims)) {
+    checks.push(check(c.label, c.ok ? "ok" : "fail", c.detail));
+    if (!c.ok) claimsFailed = true;
+  }
+  if (claimsFailed) return { verdict: VERDICT.FAILED, checks };
+
+  // The chain. Everything above came from the issuer; this does not.
+  let tx;
+  try {
+    tx = await getTransaction(claims.tx_hash);
+  } catch (e) {
+    checks.push(check("the payment read from Solana", "unresolved", e.message));
+    return { verdict: VERDICT.UNRESOLVED, checks };
+  }
+  if (!tx) {
+    checks.push(
+      check("the payment read from Solana", "unresolved", "this RPC does not have that transaction; try another with VB_RPC")
+    );
+    return { verdict: VERDICT.UNRESOLVED, checks };
+  }
+  if (tx.failed) {
+    checks.push(check("the payment it names succeeded on-chain", "fail", "it reverted; nothing was paid"));
+    return { verdict: VERDICT.FAILED, checks };
+  }
+  checks.push(check("the payment it names succeeded on-chain", "ok", `slot ${tx.slot}`));
+
+  const landed = tx.tokenDeltas.find((d) => d.owner === claims.pay_to && d.mint === claims.asset);
+  const received = landed ? BigInt(landed.delta) : 0n;
+  const owed = BigInt(claims.amount);
+  const amountOk = received >= owed;
+  const units = (raw) =>
+    landed?.decimals != null ? `${formatUnits(raw.toString(), landed.decimals)} ${claims.currency}` : `${raw} atomic ${claims.currency}`;
+  checks.push(
+    check(
+      "moved at least the stated amount of the stated asset to the stated wallet",
+      amountOk ? "ok" : "fail",
+      amountOk
+        ? units(received)
+        : landed
+          ? `chain shows ${units(received)}, receipt says ${units(owed)}`
+          : "no balance of that asset changed for that wallet in this transaction"
+    )
+  );
+
+  let payerOk = null;
+  if (claims.payer_wallet) {
+    payerOk = tx.signers.includes(claims.payer_wallet);
+    checks.push(
+      check(
+        "signed by the payer the receipt names",
+        payerOk ? "ok" : "fail",
+        payerOk ? claims.payer_wallet : `signed by ${tx.signers.join(", ") || "nobody readable"}`
+      )
+    );
+  }
+
+  let termsState = "unresolved";
+  let termsDetail = null;
+  try {
+    const { status, json } = await apiGetTerms("/api/agent/ask", opts);
+    const accepts = status === 402 && Array.isArray(json?.accepts) ? json.accepts : [];
+    if (accepts.length) {
+      const payTos = new Set(accepts.map((a) => a?.payTo).filter((v) => typeof v === "string"));
+      const assets = new Set(accepts.map((a) => a?.asset).filter((v) => typeof v === "string"));
+      const match = payTos.has(claims.pay_to) && assets.has(claims.asset);
+      termsState = match ? "ok" : "fail";
+      termsDetail = match
+        ? null
+        : `the vault currently advertises ${[...payTos].join(", ") || "no wallet"} for ${[...assets].join(", ") || "no asset"}`;
+    } else {
+      termsDetail = "the paid lane is not answering with its terms right now, so the destination was checked against the receipt alone";
+    }
+  } catch (e) {
+    termsDetail = e.message;
+  }
+  checks.push(check("paid to the wallet the vault advertises for payment", termsState, termsDetail));
+
+  const anyFail = !amountOk || payerOk === false || termsState === "fail";
+  const verdict = anyFail ? VERDICT.FAILED : termsState === "unresolved" ? VERDICT.PARTIAL : VERDICT.VERIFIED;
+  return { verdict, checks, extra: { tx: claims.tx_hash, resource: claims.resource, jti: claims.jti } };
 }

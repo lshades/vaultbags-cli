@@ -102,6 +102,20 @@ export async function apiPost(path, body, { version = "0.0.0" } = {}) {
   return { status: res.status, json: await res.json().catch(() => null) };
 }
 
+// A GET whose 402 is the answer: a paid resource called bare describes its
+// terms in that status, so it is returned with the body rather than thrown.
+export async function apiGetTerms(path, { version = "0.0.0" } = {}) {
+  let res;
+  try {
+    res = await fetch(`${base()}${path}`, { headers: headers(version), signal: timeout() });
+  } catch (e) {
+    throw asReadable(e, base());
+  }
+  if (res.status === 429) throw new HttpError(429, path);
+  if (!res.ok && res.status !== 402) throw new HttpError(res.status, path);
+  return { status: res.status, json: await res.json().catch(() => null) };
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // One RPC call, retried while the failure still looks temporary.
@@ -346,5 +360,47 @@ export async function getTransaction(signature) {
     .filter(Boolean)
     .map((m) => m[1]);
 
-  return { memo, signers, instructions, failed: !!tx.meta?.err, slot: tx.slot ?? null };
+  return {
+    memo,
+    signers,
+    instructions,
+    failed: !!tx.meta?.err,
+    slot: tx.slot ?? null,
+    tokenDeltas: tokenDeltasFromMeta(tx.meta),
+  };
+}
+
+// How much of each token each owner gained or lost in a transaction, read from
+// the balances the chain recorded before and after it ran. Summed per (owner,
+// mint), because one owner can hold a token in more than one account and a
+// payment is judged by what the owner received, not by which account took it.
+// An account created by the transaction has no "before" and counts from zero.
+// Amounts stay exact (BigInt in, decimal string out); a balance the node did
+// not fully describe is left out rather than guessed.
+export function tokenDeltasFromMeta(meta) {
+  const pre = new Map();
+  const post = new Map();
+  const decimals = new Map();
+  const fold = (into, list) => {
+    for (const b of Array.isArray(list) ? list : []) {
+      const amount = b?.uiTokenAmount?.amount;
+      if (typeof b?.owner !== "string" || typeof b?.mint !== "string") continue;
+      if (typeof amount !== "string" || !/^\d+$/.test(amount)) continue;
+      const key = `${b.owner}|${b.mint}`;
+      into.set(key, (into.get(key) ?? 0n) + BigInt(amount));
+      if (Number.isInteger(b.uiTokenAmount.decimals)) decimals.set(key, b.uiTokenAmount.decimals);
+    }
+  };
+  fold(pre, meta?.preTokenBalances);
+  fold(post, meta?.postTokenBalances);
+  const keys = new Set([...pre.keys(), ...post.keys()]);
+  return [...keys].map((key) => {
+    const [owner, mint] = key.split("|");
+    return {
+      owner,
+      mint,
+      delta: ((post.get(key) ?? 0n) - (pre.get(key) ?? 0n)).toString(),
+      decimals: decimals.get(key) ?? null,
+    };
+  });
 }

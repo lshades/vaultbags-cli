@@ -1,6 +1,6 @@
 {
   "name": "vaultbags-cli",
-  "version": "0.4.1",
+  "version": "0.5.1",
   "description": "Read the VaultBags treasury and check it against the chain. Recomputes payouts, decisions and monthly books on your machine and reads the anchor off Solana. Never signs, never accepts a private key.",
   "type": "module",
   "bin": {
