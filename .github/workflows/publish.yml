@@ -31,16 +31,33 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      # Actions are pinned to full commit SHAs, not tags: this job can obtain
+      # npm publishing credentials, and a tag can be moved to other code.
+      # Verified 2026-09-26: each commit is the one its release tag names, is
+      # signed, and is contained in its repository's main branch.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
+          # Nothing after the checkout needs git credentials.
+          persist-credentials: false
 
-      # Provenance requires a recent npm; the runner's bundled version is not
-      # guaranteed to be new enough.
-      - run: npm install -g npm@latest
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # Node 24 bundles npm 11, which trusted publishing needs (11.5.1 or
+          # later), so no npm is downloaded inside the job that can publish.
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      # Fail loudly rather than publish without trusted publishing.
+      - name: npm must support trusted publishing (11.5.1 or later)
+        run: |
+          node -e "
+            const [a, b, c] = require('child_process').execSync('npm -v').toString().trim().split('.').map(Number);
+            if (!(a > 11 || (a === 11 && (b > 5 || (b === 5 && c >= 1))))) {
+              console.error('npm ' + [a, b, c].join('.') + ' is older than 11.5.1');
+              process.exit(1);
+            }
+          "
 
       # No dependencies to install: the tool has none on purpose, so there is
       # nothing here that could substitute code between the tag and the publish.
