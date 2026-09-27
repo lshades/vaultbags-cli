@@ -656,7 +656,7 @@ export async function verifyLiquidity(opts) {
         check(
           "a complete liquidity record is published",
           "unresolved",
-          "the record is rebuilt from the chain on each read and was not available; no partial version is served"
+          "the record is rebuilt from the chain and could not be assembled right now; no partial version is served"
         ),
       ],
     };
@@ -766,9 +766,12 @@ export async function verifyLiquidity(opts) {
     }
   }
 
-  // Reported, never folded into the verdict: this one is the API's word.
+  // Reported, never folded into the verdict: this one is the API's word. The API
+  // states when it read the position (positionReadAt), so that age is quoted
+  // rather than implied; older deployments without the field say nothing.
   const allLocked = record?.lock?.allLocked;
   const unlocked = record?.lock?.unlockedLiquidity;
+  const positionReadAt = typeof record?.positionReadAt === "string" ? record.positionReadAt : null;
   checks.push(
     check(
       allLocked === true
@@ -776,7 +779,9 @@ export async function verifyLiquidity(opts) {
         : "the position's current lock state",
       "note",
       allLocked === true
-        ? `unlocked liquidity ${unlocked ?? "0"}, read live from the pool by the API and not re-derived here`
+        ? `unlocked liquidity ${unlocked ?? "0"}, as the API read it from the pool position${
+            positionReadAt ? ` at ${positionReadAt}` : ""
+          }; not re-derived here`
         : "not asserted by this run"
     )
   );
