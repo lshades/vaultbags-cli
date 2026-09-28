@@ -14,15 +14,30 @@
 import {
   sha256,
   canonicalStringify,
+  hashLeaf,
   foldProof,
   buildRoot,
   decisionPayload,
   strategyPayload,
   monthlyPayload,
-  hashFromMemo,
+  claimsMemo,
+  decisionMemo,
+  strategyMemo,
+  monthlyMemo,
 } from "./canonical.js";
-import { apiGet, apiGetTerms, getTransaction, getSignatureStatuses, getMintPrograms, getOwnerBalances, formatUnits } from "./io.js";
+import {
+  apiGet,
+  apiGetTerms,
+  getTransaction,
+  getSignatureStatuses,
+  getMintPrograms,
+  getOwnerBalances,
+  formatUnits,
+  programInstructions,
+  redact,
+} from "./io.js";
 import { decodeReceipt, verifyReceiptSignature, checkReceiptClaims } from "./receipt.js";
+import { TREASURY, DAMM_V2_PROGRAM } from "./pinned.js";
 
 export const VERDICT = {
   VERIFIED: "verified",
@@ -35,6 +50,22 @@ export const VERDICT = {
   // anything.
   PARTIAL: "partial",
 };
+
+// Exit codes, one rule for every verify command:
+//   0  verified against the chain
+//   1  failed: the chain, or the records themselves, contradict the claim
+//   2  usage error, or a refused argument (decided before any verdict exists)
+//   3  not settled either way: not anchored yet, partly verified, or a read
+//      that could not be completed
+// Only 0 means verified. Not-yet-anchored and partly-verified used to exit 0
+// too, which let a script that trusts the exit code treat "nothing on-chain to
+// check against" as a pass, the exact confusion the verdict words exist to
+// prevent.
+export function exitCodeFor(verdict) {
+  if (verdict === VERDICT.VERIFIED) return 0;
+  if (verdict === VERDICT.FAILED) return 1;
+  return 3;
+}
 
 const check = (label, state, detail) => ({ label, state, detail: detail || null });
 
@@ -77,9 +108,15 @@ const tooLarge = (what, n, cap) => ({
 // "0.00292100" -> "0.002921", and "1.000" -> "1". Display only.
 const trimZeros = (s) => (s.includes(".") ? s.replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "") : s);
 
-// Shared: read the anchoring transaction and confirm it says what the API said
-// it says, and that the wallet that must have signed it did.
-async function checkAnchor(checks, { receiptTx, expectedHash, expectedMemo, expectedSigner }) {
+// Shared: read the anchoring transaction from Solana and decide from it alone.
+//
+// Three things, none of them taken from the API: the transaction succeeded, the
+// treasury signed it (pinned in src/pinned.js, because a memo is free text any
+// wallet can write and the accused does not get to name the author), and it
+// carries exactly the memo the record implies, rebuilt here from what was
+// recomputed. The API may say which signer it expects; if that disagrees with
+// the pinned one, the API is contradicting the tool, and that is a failure.
+async function checkAnchor(checks, { receiptTx, expectedMemo, apiSigner }) {
   let tx;
   try {
     tx = await getTransaction(receiptTx);
@@ -98,50 +135,40 @@ async function checkAnchor(checks, { receiptTx, expectedHash, expectedMemo, expe
     return VERDICT.FAILED;
   }
 
-  const onChainHash = hashFromMemo(tx.memo);
-  const hashOk = onChainHash === expectedHash;
+  if (apiSigner && apiSigner !== TREASURY) {
+    checks.push(check("the API names the treasury this tool pins", "fail", `it names ${apiSigner}`));
+    return VERDICT.FAILED;
+  }
+  const signerOk = tx.signers.includes(TREASURY);
   checks.push(
     check(
-      "hash in the on-chain memo matches the one computed here",
-      hashOk ? "ok" : "fail",
-      hashOk ? null : `chain says ${onChainHash || "no hash in memo"}`
-    )
-  );
-
-  if (expectedMemo) {
-    const memoOk = tx.memo === expectedMemo;
-    checks.push(
-      check("memo matches character for character", memoOk ? "ok" : "fail", memoOk ? null : tx.memo || "(no memo)")
-    );
-    if (!memoOk) return VERDICT.FAILED;
-  }
-
-  if (!expectedSigner) {
-    // Silence here would be the dangerous option. A memo is free text that any
-    // wallet can write, so an anchor whose author was never identified is
-    // weaker than one that was, and printing VERIFIED for both would hide the
-    // difference behind the same word.
-    checks.push(
-      check(
-        "the wallet that stamped it could not be identified",
-        "unresolved",
-        "this response did not publish expectedSigner, so the signature was not checked"
-      )
-    );
-    return hashOk ? VERDICT.PARTIAL : VERDICT.FAILED;
-  }
-
-  const signerOk = tx.signers.includes(expectedSigner);
-  checks.push(
-    check(
-      "signed by the treasury that owns it",
+      "signed by the treasury (pinned in this tool, not read from the API)",
       signerOk ? "ok" : "fail",
-      signerOk ? expectedSigner : `signed by ${tx.signers.join(", ") || "nobody readable"}`
+      signerOk ? TREASURY : `signed by ${tx.signers.join(", ") || "nobody readable"}`
     )
   );
   if (!signerOk) return VERDICT.FAILED;
 
-  return hashOk ? VERDICT.VERIFIED : VERDICT.FAILED;
+  const memoOk = tx.memos.includes(expectedMemo);
+  checks.push(
+    check(
+      "the on-chain memo is exactly the one recomputed here",
+      memoOk ? "ok" : "fail",
+      memoOk ? expectedMemo : `expected ${expectedMemo}; the chain carries ${tx.memos.join(" | ") || "no memo"}`
+    )
+  );
+  return memoOk ? VERDICT.VERIFIED : VERDICT.FAILED;
+}
+
+// Hashing a published record throws on a malformed amount. That is the record
+// failing to be what it claims, so it is reported as a failed check instead of
+// ending the command with a stack trace.
+function tryHash(fn) {
+  try {
+    return { ok: true, value: fn() };
+  } catch (e) {
+    return { ok: false, reason: e?.message || String(e) };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,39 +180,72 @@ export async function verifyClaim(tx, opts) {
     return { verdict: VERDICT.FAILED, checks: [check("claim is on record", "fail", claim?.error || claim?.note)] };
   }
 
-  const folded = foldProof(claim.leaf, claim.proof);
-  const proofOk = folded === claim.root;
-  checks.push(check("your claim's proof folds to the day's root", proofOk ? "ok" : "fail", proofOk ? null : folded));
+  // The record must be the one asked about. A proof for some OTHER payout folds
+  // to the same root just as well, so without this an endpoint could answer any
+  // signature with any valid claim and every check below would pass.
+  const leafTx = claim?.leaf?.tx;
+  const sameClaim = typeof leafTx === "string" && leafTx === tx;
+  checks.push(
+    check(
+      "the record returned is the claim asked about",
+      sameClaim ? "ok" : "fail",
+      sameClaim ? null : `it describes ${leafTx ? redact(leafTx) : "no transaction"}`
+    )
+  );
+  if (!sameClaim) return { verdict: VERDICT.FAILED, checks };
+
+  const leafHash = tryHash(() => hashLeaf(claim.leaf));
+  const folded = leafHash.ok ? tryHash(() => foldProof(claim.leaf, claim.proof)) : leafHash;
+  if (!folded.ok) {
+    checks.push(check("your claim's record is well-formed", "fail", folded.reason));
+    return { verdict: VERDICT.FAILED, checks };
+  }
+  const proofOk = folded.value === claim.root;
+  checks.push(check("your claim's proof folds to the day's root", proofOk ? "ok" : "fail", proofOk ? null : folded.value));
 
   // Rebuilding the whole day from the published set is what catches a claim
   // that was quietly dropped from the tree rather than altered inside it.
   const day = await apiGet(`/api/proof/claims/${encodeURIComponent(claim.period)}`, opts);
   const dayLeaves = day.leaves || [];
   if (dayLeaves.length > LIMITS.leaves) return tooLarge("claims", dayLeaves.length, LIMITS.leaves);
-  const rebuilt = buildRoot(dayLeaves);
-  const rootOk = rebuilt === claim.root;
+  if (day?.period !== claim.period) {
+    checks.push(check("the day's claims are the day the claim names", "fail", `asked for ${claim.period}, got ${day?.period}`));
+    return { verdict: VERDICT.FAILED, checks };
+  }
+  const rebuiltRes = tryHash(() => buildRoot(dayLeaves));
+  if (!rebuiltRes.ok) {
+    checks.push(check("the day's published claims are well-formed", "fail", rebuiltRes.reason));
+    return { verdict: VERDICT.FAILED, checks };
+  }
+  const rebuilt = rebuiltRes.value;
+  const rootOk = rebuilt != null && rebuilt === claim.root;
   checks.push(
     check(
-      `the whole day's root, rebuilt here from all ${day.claimCount ?? "?"} claims`,
+      `the whole day's root, rebuilt here from all ${dayLeaves.length} claims`,
       rootOk ? "ok" : "fail",
       rootOk ? null : rebuilt
     )
   );
+  // Asked directly rather than inferred from the two checks above, so the line
+  // a reader looks for is there to find.
+  const inDay = dayLeaves.some((l) => tryHash(() => hashLeaf(l)).value === leafHash.value);
+  checks.push(check("your claim is one of that day's published claims", inDay ? "ok" : "fail"));
+  const recordsOk = proofOk && rootOk && inDay;
 
   if (!claim.stamped || !claim.receiptTx) {
     checks.push(check("anchor on-chain", "pending", "this day is not stamped yet; it stamps on the next daily cycle"));
-    return { verdict: proofOk && rootOk ? VERDICT.NO_ANCHOR : VERDICT.FAILED, checks, extra: { period: claim.period } };
+    return { verdict: recordsOk ? VERDICT.NO_ANCHOR : VERDICT.FAILED, checks, extra: { period: claim.period } };
   }
 
-  // The signer is checked here too, not only for the daily decision. A memo is
-  // free text: anyone can stamp any hash from any wallet, so an anchor nobody
-  // identified is an anchor that proves nothing.
+  // The memo carries the day, the number of claims and the root, all three
+  // rebuilt here: the right root stamped under another day or count is a
+  // different statement.
   const anchor = await checkAnchor(checks, {
     receiptTx: claim.receiptTx,
-    expectedHash: claim.root,
-    expectedSigner: claim.expectedSigner || null,
+    expectedMemo: claimsMemo({ period: claim.period, count: dayLeaves.length, root: rebuilt }),
+    apiSigner: claim.expectedSigner || null,
   });
-  const verdict = proofOk && rootOk ? anchor : VERDICT.FAILED;
+  const verdict = recordsOk ? anchor : VERDICT.FAILED;
   return { verdict, checks, extra: { period: claim.period, receiptTx: claim.receiptTx } };
 }
 
@@ -194,6 +254,14 @@ export async function verifyAllocation(date, opts) {
   const d = await apiGet(`/api/proof/decision/${encodeURIComponent(date)}`, opts);
   if (d?.error) {
     return { verdict: VERDICT.FAILED, checks: [check("decision is on record", "fail", d.error)] };
+  }
+  // Another day's decision is just as well anchored, so an answer for the
+  // wrong day would pass every check below.
+  if (d?.date !== date) {
+    return {
+      verdict: VERDICT.FAILED,
+      checks: [check("the decision returned is for the day asked about", "fail", `asked for ${date}, got ${d?.date}`)],
+    };
   }
 
   const localHash = sha256(canonicalStringify(decisionPayload(d)));
@@ -210,9 +278,8 @@ export async function verifyAllocation(date, opts) {
 
   const anchor = await checkAnchor(checks, {
     receiptTx: d.receiptTx,
-    expectedHash: localHash,
-    expectedMemo: d.memoText,
-    expectedSigner: d.expectedSigner,
+    expectedMemo: decisionMemo({ date: d.date, weights: d.weights, hash: localHash }),
+    apiSigner: d.expectedSigner,
   });
   return {
     verdict: selfOk ? anchor : VERDICT.FAILED,
@@ -235,6 +302,22 @@ export async function verifyStrategy(id, date, opts) {
   if (d?.error) {
     return { verdict: VERDICT.FAILED, checks: [check("strategy decision is on record", "fail", d.error)] };
   }
+  // The day and the strategy must be the ones asked about: another strategy's
+  // pick, or another day's, is just as well anchored.
+  const byKey = /^[0-9a-f]{64}$/.test(id);
+  const sameStrategy = byKey ? d?.strategyKey === id : d?.presetId === id;
+  if (d?.date !== date || !sameStrategy) {
+    return {
+      verdict: VERDICT.FAILED,
+      checks: [
+        check(
+          "the decision returned is for the strategy and day asked about",
+          "fail",
+          `asked for ${id} on ${date}, got ${(byKey ? d?.strategyKey : d?.presetId) ?? "none"} on ${d?.date}`
+        ),
+      ],
+    };
+  }
 
   const localHash = sha256(canonicalStringify(strategyPayload(d)));
   const label = d.presetId ? d.presetId : `${(d.strategyKey || "").slice(0, 12)}…`;
@@ -256,9 +339,8 @@ export async function verifyStrategy(id, date, opts) {
 
   const anchor = await checkAnchor(checks, {
     receiptTx: d.receiptTx,
-    expectedHash: localHash,
-    expectedMemo: d.memoText,
-    expectedSigner: d.expectedSigner,
+    expectedMemo: strategyMemo({ date: d.date, strategyKey: d.strategyKey, hash: localHash }),
+    apiSigner: d.expectedSigner,
   });
   return {
     verdict: selfOk ? anchor : VERDICT.FAILED,
@@ -376,6 +458,8 @@ export async function verifyReserves(opts) {
           const prev = onChainByMint.get(m);
           onChainByMint.set(m, {
             raw: (prev?.raw ?? 0n) + held.raw,
+            display:
+              (prev && prev.display === null) || held.display === null ? null : (prev?.display ?? 0n) + held.display,
             decimals: prev?.decimals ?? held.decimals,
           });
         }
@@ -401,9 +485,18 @@ export async function verifyReserves(opts) {
     // Shown as the exact amount the chain holds, and compared as a number.
     // The comparison is a tolerance test, so a float is fine there; the printed
     // figure is what a reader will check by hand, so it is not.
+    //
+    // Stored units on both sides (see getOwnerBalances). Where a wallet would
+    // display more, because the token applies a growing multiplier over what it
+    // stores, that is said, so the reader who opens a wallet and sees a larger
+    // figure knows why rather than suspecting one of the two numbers.
     const held = onChainByMint.get(r.mint);
     const shown = held ? formatUnits(held.raw, held.decimals ?? r.decimals) : "0";
     const onChain = Number(shown);
+    const displayNote =
+      held && held.display != null && held.display !== held.raw
+        ? `stored units; a wallet displays ${formatUnits(held.display, held.decimals ?? r.decimals)} for the same holding, because this token applies a multiplier over what it stores`
+        : null;
 
     const published = Number(r.balance) || 0;
     const gap = onChain - published;
@@ -429,7 +522,8 @@ export async function verifyReserves(opts) {
         : gap > 0
           ? `holding ${gapShown} more than the headline`
           : `short by ${gapShown}, inside the ${(RESERVE_TOLERANCE * 100).toFixed(0)}% tolerance`;
-      checks.push(check(`${r.name}: ${shown} on-chain against ${published} published`, "ok", note));
+      const detail = [note, displayNote].filter(Boolean).join("; ") || null;
+      checks.push(check(`${r.name}: ${shown} on-chain against ${published} published`, "ok", detail));
       continue;
     }
 
@@ -441,7 +535,9 @@ export async function verifyReserves(opts) {
       check(
         `${r.name}: ${shown} on-chain against ${published} published`,
         "fail",
-        `short by ${gapShown}, past the ${(RESERVE_TOLERANCE * 100).toFixed(0)}% tolerance`
+        [`short by ${gapShown}, past the ${(RESERVE_TOLERANCE * 100).toFixed(0)}% tolerance`, displayNote]
+          .filter(Boolean)
+          .join("; ")
       )
     );
   }
@@ -479,11 +575,18 @@ export async function verifyReport(period, opts) {
   if (r?.error) {
     return { verdict: VERDICT.FAILED, checks: [check("report is on record", "fail", r.error)] };
   }
+  // Another month's books are just as well anchored.
+  if (r?.period !== period) {
+    return {
+      verdict: VERDICT.FAILED,
+      checks: [check("the report returned is for the month asked about", "fail", `asked for ${period}, got ${r?.period}`)],
+    };
+  }
 
   // Rebuilt from the named fields rather than hashing the object as received,
   // so a payload padded with an extra key gains nothing. The metrics are taken
   // out of the published payload and the envelope is rebuilt around them here.
-  const monthPeriod = r.period ?? period;
+  const monthPeriod = period;
   const localHash = sha256(
     canonicalStringify(monthlyPayload({ period: monthPeriod, metrics: r.payload?.metrics ?? null }))
   );
@@ -501,19 +604,13 @@ export async function verifyReport(period, opts) {
 
   const anchor = await checkAnchor(checks, {
     receiptTx,
-    expectedHash: localHash,
-    // The memo is published alongside, so it can be compared in full rather
-    // than only through the hash it ends with.
-    expectedMemo: r.memo ?? null,
-    expectedSigner: r.expectedSigner ?? null,
+    expectedMemo: monthlyMemo({ period: monthPeriod, hash: localHash }),
+    apiSigner: r.expectedSigner ?? null,
   });
   return { verdict: selfOk ? anchor : VERDICT.FAILED, checks, extra: { period: monthPeriod } };
 }
 
 
-// The most recent stamped day of claims, verified end to end without needing a
-// transaction signature in hand: rebuild the day's root from the published
-// leaves, compare it with the stamped one, then check the anchor and who
 // Did a day's payouts actually land? Asked of YOUR node, not of the protocol.
 //
 // `verify claim` proves one payout is inside the day's anchored root, and
@@ -632,7 +729,10 @@ export async function verifyPayouts(period, opts) {
 // own verdict would be worth less than no verifier.
 //
 // Lock instructions are read in full, not sampled: a sampled check would let
-// exactly the unchecked one be the fabricated one.
+// exactly the unchecked one be the fabricated one. And a lock counts only when
+// the pool program itself logged it (src/io.js programInstructions): the name
+// is plain text any program or memo can print, so matching it anywhere in the
+// logs would accept a transaction that merely said the words.
 const LOCK_INSTRUCTION = "PermanentLockPosition";
 
 
@@ -725,6 +825,7 @@ export async function verifyLiquidity(opts) {
   // Existing is not the same as having run. Read what each lock transaction
   // actually executed.
   let locksRan = 0;
+  let locksNotRun = 0;
   let lockSignerOk = true;
   let lockReadFailed = 0;
   for (const sig of lockSigs) {
@@ -739,20 +840,25 @@ export async function verifyLiquidity(opts) {
       lockReadFailed += 1;
       continue;
     }
-    if ((tx.instructions || []).includes(LOCK_INSTRUCTION)) locksRan += 1;
+    const ran = programInstructions(tx.logs, DAMM_V2_PROGRAM);
+    if (ran.names.includes(LOCK_INSTRUCTION)) locksRan += 1;
+    else if (!ran.readable) lockReadFailed += 1; // a cut log is "could not tell", not "did not run"
+    else locksNotRun += 1;
     if (wallet && !(tx.signers || []).includes(wallet)) lockSignerOk = false;
   }
 
   if (lockSigs.length) {
+    // One lock proven not to have run is a failure even when another could not
+    // be read: the unreadable one cannot make the proven one true.
+    const detail = [
+      locksNotRun > 0 ? `${locksNotRun} ran without the pool program making the position permanent` : null,
+      lockReadFailed > 0 ? `${lockReadFailed} could not be read from this node` : null,
+    ].filter(Boolean);
     checks.push(
       check(
-        `${locksRan} of ${lockSigs.length} lock transactions executed ${LOCK_INSTRUCTION}`,
-        locksRan === lockSigs.length ? "ok" : lockReadFailed > 0 ? "unresolved" : "fail",
-        locksRan === lockSigs.length
-          ? null
-          : lockReadFailed > 0
-            ? `${lockReadFailed} could not be read from this node`
-            : "a transaction exists but did not run the instruction that makes a position permanent"
+        `${locksRan} of ${lockSigs.length} lock transactions had the pool program run ${LOCK_INSTRUCTION}`,
+        locksRan === lockSigs.length ? "ok" : locksNotRun > 0 ? "fail" : "unresolved",
+        detail.length ? detail.join("; ") : null
       )
     );
     if (wallet) {
@@ -790,7 +896,7 @@ export async function verifyLiquidity(opts) {
     unknown > 0 || lockReadFailed > 0 || record.complete === false || addSigs.length !== deposits.length;
 
   const verdict =
-    failed > 0 || !lockSignerOk || (lockSigs.length > 0 && locksRan < lockSigs.length && lockReadFailed === 0)
+    failed > 0 || !lockSignerOk || locksNotRun > 0
       ? VERDICT.FAILED
       : anythingUnresolved
         ? VERDICT.UNRESOLVED
@@ -801,6 +907,9 @@ export async function verifyLiquidity(opts) {
   return { verdict, checks };
 }
 
+// The most recent stamped day of claims, verified end to end without needing a
+// transaction signature in hand: rebuild the day's root from the published
+// leaves, compare it with the stamped one, then check the anchor and who
 // signed it. This is what lets `verify all` cover the claim ledger.
 export async function verifyLatestDay(opts) {
   const checks = [];
@@ -816,11 +925,20 @@ export async function verifyLatestDay(opts) {
   const day = await apiGet(`/api/proof/claims/${encodeURIComponent(latest.period)}`, opts);
   const dayLeaves = day.leaves || [];
   if (dayLeaves.length > LIMITS.leaves) return tooLarge("claims", dayLeaves.length, LIMITS.leaves);
-  const rebuilt = buildRoot(dayLeaves);
+  if (day?.period !== latest.period) {
+    checks.push(check("the day's claims are the day asked about", "fail", `asked for ${latest.period}, got ${day?.period}`));
+    return { verdict: VERDICT.FAILED, checks };
+  }
+  const rebuiltRes = tryHash(() => buildRoot(dayLeaves));
+  if (!rebuiltRes.ok) {
+    checks.push(check("the day's published claims are well-formed", "fail", rebuiltRes.reason));
+    return { verdict: VERDICT.FAILED, checks };
+  }
+  const rebuilt = rebuiltRes.value;
   const rootOk = rebuilt != null && rebuilt === day.root;
   checks.push(
     check(
-      `day ${day.period}: root rebuilt here from all ${day.claimCount ?? "?"} claims`,
+      `day ${day.period}: root rebuilt here from all ${dayLeaves.length} claims`,
       rootOk ? "ok" : "fail",
       rootOk ? null : `rebuilt ${rebuilt}`
     )
@@ -833,8 +951,8 @@ export async function verifyLatestDay(opts) {
 
   const anchor = await checkAnchor(checks, {
     receiptTx: day.receiptTx,
-    expectedHash: rebuilt,
-    expectedSigner: day.expectedSigner ?? null,
+    expectedMemo: claimsMemo({ period: day.period, count: dayLeaves.length, root: rebuilt }),
+    apiSigner: day.expectedSigner ?? null,
   });
   return { verdict: rootOk ? anchor : VERDICT.FAILED, checks, extra: { period: day.period } };
 }

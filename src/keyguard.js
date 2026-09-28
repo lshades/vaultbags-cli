@@ -37,11 +37,30 @@ export function looksLikeMnemonic(value) {
   return words.every((w) => /^[a-z]{3,8}$/.test(w));
 }
 
+// A seed phrase INSIDE a longer text: twelve or more mnemonic-shaped words in a
+// row, anywhere. Checking only a whole value of exactly 12/15/18/21/24 words
+// missed the phrase with a word of context around it, and missed it entirely
+// when typed without quotes: then every word is its own argument, none of them
+// looks like anything, and `ask` joins them back into a question and sends it
+// to a server. Every BIP39 word has three to eight letters, so a real phrase
+// always forms such a run; a sentence rarely does, because short words ("a",
+// "is", "to") and punctuation break it.
+const MNEMONIC_RUN = 12;
+export function containsMnemonic(value) {
+  if (typeof value !== "string") return false;
+  let run = 0;
+  for (const w of value.trim().toLowerCase().split(/\s+/)) {
+    run = /^[a-z]{3,8}$/.test(w) ? run + 1 : 0;
+    if (run >= MNEMONIC_RUN) return true;
+  }
+  return false;
+}
+
 export function looksLikeSecret(value) {
   if (typeof value !== "string") return false;
   const v = value.trim();
   if (!v) return false;
-  if (looksLikeMnemonic(v)) return true;
+  if (looksLikeMnemonic(v) || containsMnemonic(v)) return true;
   if (BYTE_ARRAY.test(v)) return true;
   // A transaction signature is also base58 and around this length, so the
   // check is scoped to values that are NOT being used as a signature argument.
@@ -69,6 +88,14 @@ const PUBLIC_ID_FLAG = /^--?(tx|txid|signature|sig|hash|root)(=|$)/i;
 // transaction signature is the core argument of the core command. The caller
 // marks which positions are signatures so the guard can tell "the thing you are
 // verifying" from "a secret you should never have typed".
+// A question can trip the seed-phrase check: a dozen short lowercase words with
+// no punctuation is also the shape of a seed phrase, and the two cannot be told
+// apart without the wordlist. So the message covers both readings rather than
+// accusing someone of pasting a key.
+const MNEMONIC_REASON =
+  "That looks like a seed phrase. This tool never accepts one, and never signs anything. If it was a question, rephrase it or add punctuation.";
+const KEY_REASON = "That looks like a private key. This tool never accepts one, and never signs anything.";
+
 export function refuseSecretArgs(argv = [], { signatureArgs = [] } = {}) {
   const allowed = new Set(signatureArgs);
 
@@ -86,21 +113,34 @@ export function refuseSecretArgs(argv = [], { signatureArgs = [] } = {}) {
     // --flag=value: judge the value on its own.
     const eq = raw.indexOf("=");
     const value = raw.startsWith("-") && eq > -1 ? raw.slice(eq + 1) : raw;
+
+    // A seed phrase or a keypair file's byte array is never a signature, a
+    // hash or a receipt, so no exemption below covers them. Being the argument
+    // of `verify claim` used to skip every check, which let a quoted seed
+    // phrase through in exactly the position people paste into.
+    if (containsMnemonic(value)) return { refuse: true, reason: MNEMONIC_REASON };
+    if (BYTE_ARRAY.test(value)) return { refuse: true, reason: KEY_REASON };
+
+    // The exemptions only cover what they exist for: a long base58 or hex value
+    // that is a public 64-byte identifier.
     if (allowed.has(value)) continue;
     if (PUBLIC_ID_FLAG.test(raw)) continue;
     if (looksLikeSecret(value)) {
-      return {
-        refuse: true,
-        reason: looksLikeMnemonic(value)
-          ? // A question can trip this: a dozen short lowercase words with no
-            // punctuation is also the shape of a seed phrase, and the two cannot
-            // be told apart without the wordlist. So the message covers both
-            // readings rather than accusing someone of pasting a key.
-            "That looks like a seed phrase. This tool never accepts one, and never signs anything. If it was a question, rephrase it or add punctuation."
-          : "That looks like a private key. This tool never accepts one, and never signs anything.",
-      };
+      return { refuse: true, reason: looksLikeMnemonic(value) ? MNEMONIC_REASON : KEY_REASON };
     }
   }
+
+  // The positional words read together, as `ask` will send them. Typed without
+  // quotes, a seed phrase arrives one word per argument and passes every check
+  // above one word at a time.
+  // The command word itself ("ask", "verify") is left out: it is never part of
+  // what was pasted, and counting it would make an eleven-word question trip.
+  const joined = argv
+    .filter((a) => typeof a === "string" && !a.startsWith("-"))
+    .slice(1)
+    .join(" ");
+  if (containsMnemonic(joined)) return { refuse: true, reason: MNEMONIC_REASON };
+
   return { refuse: false };
 }
 

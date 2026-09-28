@@ -34,22 +34,24 @@ vaultbags verify receipt <jwt>         # a paid call's signed receipt, then the 
 
 `verify payouts` is the one that asks the question a holder actually cares about. The other checks prove a record is the one anchored on-chain; a payout can sit in a perfectly valid tree and still name a transaction the chain rejected. This takes the day's published claim set, pulls the signature out of every record and asks the chain the status of each. The protocol publishes its own count of this; the command deliberately does not use it, because a verifier that accepts the answer it was handed has verified nothing.
 
-`verify liquidity` answers the question asked of every token: whether the people behind it can pull the floor out. It takes the protocol's published liquidity record, and asks the chain about every transaction in it: that each deposit happened and was accepted, that each lock RAN the instruction that makes a position permanent rather than merely existing, and that all of them were signed by the wallet the record names. It comes back partly-verified on purpose. Whether the position holds withdrawable liquidity at this instant is a live account read that needs the pool program's layout, which this tool does not carry, so that one figure is shown as the protocol's own word, with the time the protocol says it read the position, and is deliberately not folded into the verdict. A verifier that counted someone else's assertion as its own pass would be worth less than no verifier.
+`verify liquidity` answers the question asked of every token: whether the people behind it can pull the floor out. It takes the protocol's published liquidity record, and asks the chain about every transaction in it: that each deposit happened and was accepted, that in each lock the pool program itself RAN the instruction that makes a position permanent (read from the runtime's call stack in the logs, because any program or memo can print the instruction's name), and that all of them were signed by the wallet the record names. It comes back partly-verified on purpose. Whether the position holds withdrawable liquidity at this instant is a live account read that needs the pool program's layout, which this tool does not carry, so that one figure is shown as the protocol's own word, with the time the protocol says it read the position, and is deliberately not folded into the verdict. A verifier that counted someone else's assertion as its own pass would be worth less than no verifier.
 
 `verify receipt` is for the paying side. Every response the paid lane settles on-chain carries an `X-X402-Receipt` header: a signed token naming the transaction, the payer, the amount, the destination wallet, the asset and the resource, with a unique id and an expiry. The command checks the signature against the key the issuer publishes at `/.well-known/jwks.json` (RS256 only; `alg: none` and HMAC are refused before any key is read), holds the claims to their own rules, and then asks the chain whether the transfer the receipt names landed where it says, for at least the amount it says, signed by the payer it says. The signature proves who issued the receipt; the chain proves the payment happened. It is the second that makes the verdict independent, so a receipt whose transaction this node cannot see comes back unresolved, not verified. The destination is also compared with the wallet the vault advertises live in its payment terms; when those cannot be read, the verdict is partial and says so.
 
 Add `--json` to any of them for machine-readable output with the same exit codes, so this can sit inside a monitor or a CI step.
 
-Each one recomputes the hash locally and then reads the anchoring transaction from Solana, and checks that the treasury signed it. A memo is free text that any wallet can write, so an anchor whose author went unchecked proves that somebody stamped a hash, not that this one did.
+Exit codes: `0` verified, `1` failed, `2` usage error or a refused argument, `3` not settled either way (not anchored yet, partly verified, or a read that could not complete). Only `0` means verified, so a script can rely on it.
 
-`verify reserves` adds up every published reserve wallet, so on the default public RPC it can pause once while the endpoint's rate limit clears. Point `VB_RPC` at your own node and it does not.
+Each one recomputes the record locally, rebuilds the exact memo that record implies (for a claims day: the date, the number of claims and the root; for a decision: the date, the weights and the hash), and then reads the anchoring transaction from Solana: it must have succeeded, carry that memo character for character, and be signed by the treasury. The treasury is pinned in [`src/pinned.js`](src/pinned.js), not read from the API. A memo is free text that any wallet can write, so an anchor whose author the accused got to name would prove nothing; if the API names a different signer, that disagreement is itself a failure. The record must also be the one asked for: a valid proof for some other claim, or another day's decision, fails.
+
+`verify reserves` adds up every published reserve wallet, so on the default public RPC it can pause once while the endpoint's rate limit clears. Point `VB_RPC` at your own node and it does not. It compares stored units, which is what the vault publishes. One of the assets applies a growing display multiplier over what it stores, so a wallet shows slightly more of it than the stored figure; the check says so on that line rather than comparing the displayed amount, which would read the chain as richer than it is.
 
 The verdicts are deliberately distinct, because they mean different things:
 
 - **VERIFIED** the recomputation matched, and it matched what is stamped on-chain.
 - **CONSISTENT, NOT YET ANCHORED** the published records agree with each other, but that day has not been stamped yet. This is not a pass, and it does not pretend to be one: recomputing over data the operator handed you proves the response is internally consistent, which a dishonest operator could fake perfectly.
 - **UNRESOLVED** something could not be settled either way, so it counts as neither pass nor fail. Each line says which: an endpoint that would not answer is yours to retry, while a figure held in wallets nobody publishes is simply outside what public data can settle.
-- **PARTLY VERIFIED** everything public data can prove held, and something else was outside its reach. This is what you get when an anchor's expected signer is not published: the memo matched, but who stamped it went unchecked, and that is not the same thing.
+- **PARTLY VERIFIED** everything public data can prove held, and something else was outside its reach. `verify liquidity` always ends here (the position's live state is the protocol's word), and so does `verify receipt` when the vault's payment terms cannot be read to compare the destination.
 - **VERIFICATION FAILED** something did not match. That is a finding; please report it.
 
 ## Read
@@ -83,7 +85,7 @@ If you need to move funds or claim, do it in your wallet at [vaultbags.app](http
 
 ## Don't trust this tool either
 
-The trust-critical logic lives in one short file, [`src/canonical.js`](src/canonical.js), deliberately copied rather than imported from VaultBags: a verifier that used the operator's own library to check the operator's own numbers would be asking the accused to mark their own exam. Read it in one sitting, or reimplement it in any language.
+The trust-critical logic lives in one short file, [`src/canonical.js`](src/canonical.js), deliberately copied rather than imported from VaultBags: a verifier that used the operator's own library to check the operator's own numbers would be asking the accused to mark their own exam. Read it in one sitting, or reimplement it in any language. The two identities a verdict depends on, the treasury that signs anchors and the pool program that locks liquidity, are fixed in [`src/pinned.js`](src/pinned.js), where changing them takes a release anyone can read.
 
 The anchor is read from a public Solana RPC by default. Point it at one you trust:
 
@@ -93,7 +95,7 @@ VB_RPC=https://your-rpc vaultbags verify claim <tx>
 
 If this tool and vaultbags.app ever disagree, that disagreement is the finding.
 
-There are also two standalone scripts with no install at all, [verify-claim.mjs](https://vaultbags.app/verify-claim.mjs) and [verify-decision.mjs](https://vaultbags.app/verify-decision.mjs). Nothing published to npm can match a dependency-free file you can read in one sitting, so those stay; this complements them.
+There are also three standalone scripts with no install at all, [verify-claim.mjs](https://vaultbags.app/verify-claim.mjs), [verify-decision.mjs](https://vaultbags.app/verify-decision.mjs) and [verify-report.mjs](https://vaultbags.app/verify-report.mjs), which apply the same rules (pinned signer, exact recomputed memo, exit `0` only when verified). Nothing published to npm can match a dependency-free file you can read in one sitting, so those stay; this complements them.
 
 ## Environment
 

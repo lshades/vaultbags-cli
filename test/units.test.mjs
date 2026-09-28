@@ -1,5 +1,5 @@
-// Reading a balance exactly, including the asset whose stored integer is not
-// its balance. These are the numbers the tool's whole claim rests on.
+// Reading a balance exactly, including the asset whose stored integer and
+// displayed balance differ. These are the numbers the tool's whole claim rests on.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseUnits, formatUnits } from "../src/io.js";
@@ -12,14 +12,16 @@ test("a decimal amount becomes the exact integer of its smallest unit", () => {
   assert.equal(parseUnits("0.37603864", 8), 37603864n);
 });
 
-test("a scaled balance is taken as given, not recomputed from the stored integer", () => {
-  // The case that matters: the chain reports 91044 stored and 0.00091564 held,
-  // because a multiplier sits between them. Reading the balance keeps the
-  // holding whole; recomputing it from the integer loses part of it.
-  const held = parseUnits("0.00091564", 8);
-  assert.equal(held, 91564n);
-  assert.notEqual(held, 91044n, "the stored integer is not the balance");
-  assert.equal(formatUnits(held, 8), "0.00091564");
+test("a scaled display parses exactly, and stays distinct from the stored integer", () => {
+  // The chain reports 91044 stored and 0.00091564 displayed for the same
+  // holding, because a multiplier sits between them. The reserves check
+  // compares the STORED figure (the unit vaultbags.app publishes) and reports
+  // the display beside it; test/anchor.test.mjs covers that choice. Here, only
+  // that the display reads exactly and is not mistaken for the stored amount.
+  const shown = parseUnits("0.00091564", 8);
+  assert.equal(shown, 91564n);
+  assert.notEqual(shown, 91044n, "the display is not the stored integer");
+  assert.equal(formatUnits(shown, 8), "0.00091564");
 });
 
 test("adding balances stays exact, with no digits arithmetic invented", () => {

@@ -126,6 +126,35 @@ test("ordinary arguments pass untouched", () => {
   }
 });
 
+test("a seed phrase is refused even where a signature is expected", () => {
+  // The signature exemption covers long base58 only. A quoted phrase in the
+  // claim position used to skip every check, in exactly the place people paste.
+  const r = refuseSecretArgs(["verify", "claim", FAKE_MNEMONIC], { signatureArgs: [FAKE_MNEMONIC] });
+  assert.equal(r.refuse, true);
+  assert.match(r.reason, /seed phrase/i);
+  assert.equal(refuseSecretArgs(["get", "x", `--tx=${FAKE_MNEMONIC}`]).refuse, true);
+  assert.equal(refuseSecretArgs(["verify", "claim", FAKE_BYTE_ARRAY], { signatureArgs: [FAKE_BYTE_ARRAY] }).refuse, true);
+});
+
+test("a seed phrase typed without quotes is refused before it is sent anywhere", () => {
+  // One word per argument: no single argument looks like anything, and `ask`
+  // would join them back into a question for the server.
+  const r = refuseSecretArgs(["ask", ...FAKE_MNEMONIC.split(" ")]);
+  assert.equal(r.refuse, true);
+  assert.match(r.reason, /seed phrase/i);
+});
+
+test("a seed phrase with words around it is still refused", () => {
+  assert.equal(refuseSecretArgs(["ask", `is this safe: ${FAKE_MNEMONIC} thanks`]).refuse, true);
+  assert.equal(refuseSecretArgs(["ask", "is", "this", "safe", ...FAKE_MNEMONIC.split(" ")]).refuse, true);
+});
+
+test("an ordinary unquoted question still passes", () => {
+  // Short words and punctuation break the run of plain words.
+  const q = "what does the vault hold today and how often does it buy gold?".split(" ");
+  assert.equal(refuseSecretArgs(["ask", ...q]).refuse, false);
+});
+
 test("a mint address is not mistaken for a key", () => {
   // Mints are base58 but well short of a 64-byte secret.
   assert.equal(looksLikeSecret("4iCRYJHvwUcAJHrfEBQZ8mkPzRhcvW3rXk9AWuNPuMPS"), false);

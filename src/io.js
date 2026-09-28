@@ -224,6 +224,25 @@ export async function getMintPrograms(mints) {
 // "holds nothing" are different facts, and confusing them is how a healthy
 // vault gets reported as short. Whether the refusal was a throttle travels with
 // it, because that is a wait-and-retry, not a reason to doubt the vault.
+//
+// Each total carries two readings of the same holding:
+//   raw      the STORED integer the account holds, in the mint's smallest unit.
+//            This is the unit vaultbags.app publishes its reserves in, and the
+//            unit the markets price the token in, so it is the one compared.
+//   display  what a wallet shows for it (uiAmountString, as whole units), or
+//            null when the node did not state it exactly.
+// For most tokens the two are the same number. For a token with the
+// scaled-ui-amount extension a multiplier sits between them and grows as the
+// underlying pays out, so the display runs ahead of the stored amount. An
+// earlier version compared the display, from when the site published that
+// unit; once the site moved to stored units that made the chain look richer
+// than it is by the multiplier (0.63% on one asset, measured 2026-09-28), which
+// is exactly the room a shortfall would hide in. The display is still read, so
+// the check can say why a wallet shows more than the published figure.
+//
+// Summed as whole units, never as decimals: adding 0.039645 to itself in binary
+// floating point invents digits that were never on the chain, and a tool whose
+// whole claim is exactness must not print an amount the ledger does not hold.
 export async function getOwnerBalances(owner, programId) {
   const { body, throttled } = await rpcCall("getTokenAccountsByOwner", [
     owner,
@@ -235,31 +254,19 @@ export async function getOwnerBalances(owner, programId) {
   for (const a of body.result?.value || []) {
     const info = a?.account?.data?.parsed?.info;
     const mint = info?.mint;
-    // Summed in the token's own whole units, never as decimals. Adding
-    // 0.039645 to itself in binary floating point invents digits that were
-    // never on the chain, and a tool whose whole claim is exactness must not
-    // print an amount the ledger does not contain.
     const decimals = info?.tokenAmount?.decimals;
-    // uiAmountString, not `amount`. For most tokens they say the same thing,
-    // and for one of the assets held here they do not: it carries the
-    // scaled-ui-amount extension, where a multiplier sits between the stored
-    // integer and the balance, and grows as the underlying pays out. Reading
-    // the integer and dividing by the decimals therefore reports a real holding
-    // as smaller than it is, which on a reserves check looks like the vault is
-    // short. The chain already does that arithmetic and hands back the answer;
-    // taking it is both simpler and correct for every extension, including ones
-    // that do not exist yet.
-    //
-    // Still summed as whole units, never as decimals: the string is parsed into
-    // the token's own smallest unit and added there, because a tool whose whole
-    // claim is exactness must not print an amount that floating point invented.
-    const ui = info?.tokenAmount?.uiAmountString;
-    if (!mint || typeof ui !== "string" || !Number.isInteger(decimals)) continue;
-    const scaled = parseUnits(ui, decimals);
-    if (scaled === null) continue;
+    const amount = info?.tokenAmount?.amount;
+    if (!mint || !Number.isInteger(decimals)) continue;
+    // An account whose stored amount the node did not state as an integer
+    // cannot be summed exactly, and skipping it would understate the holder
+    // silently. The whole read is refused instead, which the caller reports as
+    // unreadable rather than as a smaller balance.
+    if (typeof amount !== "string" || !/^\d+$/.test(amount)) return { throttled: false };
+    const shown = parseUnits(info?.tokenAmount?.uiAmountString, decimals);
     const prev = totals.get(mint);
     totals.set(mint, {
-      raw: (prev?.raw ?? 0n) + scaled,
+      raw: (prev?.raw ?? 0n) + BigInt(amount),
+      display: prev && prev.display === null ? null : shown === null ? null : (prev?.display ?? 0n) + shown,
       decimals: prev?.decimals ?? decimals,
     });
   }
@@ -336,38 +343,85 @@ export async function getTransaction(signature) {
   const tx = body.result;
   if (!tx) return null;
 
-  const logs = tx.meta?.logMessages || [];
-  let memo = null;
-  for (const line of logs) {
-    const m = line.match(/Memo \(len \d+\): "(.*)"$/);
-    if (m) memo = m[1];
-  }
-  if (memo === null) {
-    for (const ix of tx.transaction?.message?.instructions || []) {
-      if (ix.program === "spl-memo" && typeof ix.parsed === "string") memo = ix.parsed;
-    }
-  }
+  const logs = Array.isArray(tx.meta?.logMessages) ? tx.meta.logMessages : [];
+  const memos = memosFromTx(tx);
   const signers = (tx.transaction?.message?.accountKeys || [])
     .filter((k) => k.signer)
     .map((k) => k.pubkey);
 
-  // The names of the instructions the transaction actually RAN, as the programs
-  // themselves logged them. A caller checking that a specific operation happened
-  // needs this: that a signature exists and succeeded says only that SOMETHING
-  // succeeded, which is a far weaker claim than the one usually made about it.
-  const instructions = logs
-    .map((line) => (typeof line === "string" ? line.match(/Instruction: (\w+)/) : null))
-    .filter(Boolean)
-    .map((m) => m[1]);
-
   return {
-    memo,
+    // Every memo the transaction carries, in order. A check asks whether the
+    // one it expects is AMONG them: keeping only the last would let a second
+    // memo decide what an anchor says.
+    memos,
+    memo: memos.length ? memos[memos.length - 1] : null,
     signers,
-    instructions,
+    // The raw log lines, for programInstructions below. A caller asking whether
+    // a program ran an instruction must name the program.
+    logs,
     failed: !!tx.meta?.err,
     slot: tx.slot ?? null,
     tokenDeltas: tokenDeltasFromMeta(tx.meta),
   };
+}
+
+// The memos a transaction carries, from the instructions the chain parsed. In
+// the jsonParsed encoding a memo instruction reads { program: "spl-memo",
+// parsed: "<text>" }, at the top level or inside another program's call. The
+// log line that echoes a memo is not used: it is escaped for display, and a
+// program can print a line that looks like it.
+export function memosFromTx(tx) {
+  const out = [];
+  const collect = (list) => {
+    for (const ix of Array.isArray(list) ? list : []) {
+      if (ix?.program === "spl-memo" && typeof ix.parsed === "string") out.push(ix.parsed);
+    }
+  };
+  collect(tx?.transaction?.message?.instructions);
+  for (const inner of Array.isArray(tx?.meta?.innerInstructions) ? tx.meta.innerInstructions : []) {
+    collect(inner?.instructions);
+  }
+  return out;
+}
+
+// The instructions ONE program ran, as that program logged them.
+//
+// Anchor programs log "Program log: Instruction: <Name>" when an instruction
+// starts, and that text on its own proves nothing: any program can print it,
+// and a memo can carry it. What the text cannot forge is the runtime's own
+// "Program <id> invoke [n]" and "Program <id> success" lines around it, so the
+// call stack is rebuilt from those and a name counts only when the program on
+// top of the stack is the one asked about.
+//
+// `readable` is false when the log was cut short or its stack does not close
+// cleanly. That is "could not tell", which a caller must keep apart from "did
+// not run".
+export function programInstructions(logs, programId) {
+  const stack = [];
+  const names = [];
+  let readable = true;
+  for (const line of Array.isArray(logs) ? logs : []) {
+    if (typeof line !== "string") continue;
+    if (line === "Log truncated") {
+      readable = false;
+      continue;
+    }
+    let m = line.match(/^Program ([1-9A-HJ-NP-Za-km-z]{32,44}) invoke \[\d+\]$/);
+    if (m) {
+      stack.push(m[1]);
+      continue;
+    }
+    m = line.match(/^Program ([1-9A-HJ-NP-Za-km-z]{32,44}) (?:success|failed: .*)$/);
+    if (m) {
+      if (stack[stack.length - 1] !== m[1]) readable = false;
+      stack.pop();
+      continue;
+    }
+    m = line.match(/^Program log: Instruction: (\w+)$/);
+    if (m && stack.length && stack[stack.length - 1] === programId) names.push(m[1]);
+  }
+  if (stack.length) readable = false;
+  return { names, readable };
 }
 
 // How much of each token each owner gained or lost in a transaction, read from

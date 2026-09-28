@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { refuseSecretArgs, warnSecretEnv, REFUSAL_ADVICE } from "../src/keyguard.js";
 import { verifyClaim, verifyAllocation, verifyStrategy, verifyReport, verifyReserves, verifyLatestDay, verifyPayouts,
-  verifyLiquidity, verifyReceipt, latestClosedMonth, VERDICT } from "../src/verify.js";
+  verifyLiquidity, verifyReceipt, latestClosedMonth, exitCodeFor, VERDICT } from "../src/verify.js";
 import { apiGet, apiPost, base, rpc, HttpError, DEFAULT_RPC } from "../src/io.js";
 
 const pkg = JSON.parse(
@@ -71,11 +71,7 @@ function printJson(result) {
   );
   // Exit codes mirror the human path exactly, so switching to --json never
   // changes whether a pipeline passes.
-  return result.verdict === VERDICT.VERIFIED ||
-    result.verdict === VERDICT.NO_ANCHOR ||
-    result.verdict === VERDICT.PARTIAL
-    ? 0
-    : 1;
+  return exitCodeFor(result.verdict);
 }
 
 function printChecks(result) {
@@ -87,7 +83,7 @@ function printChecks(result) {
   switch (result.verdict) {
     case VERDICT.VERIFIED:
       console.log(c.green(c.bold("VERIFIED")) + " against the chain, not against our word.");
-      return 0;
+      break;
     case VERDICT.NO_ANCHOR:
       // Deliberately not called verified. The records agree with each other,
       // which is not the same as agreeing with Solana.
@@ -95,13 +91,13 @@ function printChecks(result) {
         c.yellow(c.bold("CONSISTENT, NOT YET ANCHORED")) +
           " the records agree with each other, but nothing is stamped on-chain to check them against yet."
       );
-      return 0;
+      break;
     case VERDICT.PARTIAL:
       console.log(
         c.yellow(c.bold("PARTLY VERIFIED")) +
           " everything public data can prove held. What it cannot reach is named above, not counted as a pass."
       );
-      return 0;
+      break;
     case VERDICT.UNRESOLVED:
       // Deliberately not a fixed sentence. This verdict covers everything from
       // a throttled endpoint to a figure public data cannot settle, and naming
@@ -112,11 +108,11 @@ function printChecks(result) {
           " something above could not be settled either way, so it counts as neither pass nor fail."
       );
       if (result.hint) console.log(c.dim("  " + result.hint));
-      return 1;
+      break;
     default:
       console.log(c.red(c.bold("VERIFICATION FAILED")));
-      return 1;
   }
+  return exitCodeFor(result.verdict);
 }
 
 const fmtUsd = (n) =>
@@ -272,13 +268,13 @@ async function cmdVerifyAll(render) {
     results.push({ name, result });
   }
 
+  const worst = worstVerdict(results.map((r) => r.result.verdict));
   if (render === printJson) {
-    const codes = results.map(({ result }) => printableCode(result.verdict));
     console.log(
       JSON.stringify(
         {
-          verdict: worstVerdict(results.map((r) => r.result.verdict)),
-          ok: codes.every((c) => c === 0),
+          verdict: worst,
+          ok: worst === VERDICT.VERIFIED,
           sections: results.map(({ name, result }) => ({
             name,
             verdict: result.verdict,
@@ -290,23 +286,17 @@ async function cmdVerifyAll(render) {
         2
       )
     );
-    return codes.every((c) => c === 0) ? 0 : 1;
+    return exitCodeFor(worst);
   }
 
-  let code = 0;
   for (const { name, result } of results) {
     console.log(c.bold(`
 ${name}`));
-    const sectionCode = printChecks(result);
-    if (sectionCode !== 0) code = 1;
+    printChecks(result);
   }
-  return code;
-}
-
-// Exit-code mapping shared with the single commands: verified, not-yet-anchored
-// and partial pass; unresolved and failed do not.
-function printableCode(verdict) {
-  return verdict === VERDICT.VERIFIED || verdict === VERDICT.NO_ANCHOR || verdict === VERDICT.PARTIAL ? 0 : 1;
+  // Same codes as the single commands, for the worst section: one failure
+  // fails the run, and anything short of verified keeps it from passing.
+  return exitCodeFor(worst);
 }
 
 const VERDICT_RANK = [VERDICT.VERIFIED, VERDICT.NO_ANCHOR, VERDICT.PARTIAL, VERDICT.UNRESOLVED, VERDICT.FAILED];
@@ -339,6 +329,10 @@ ${c.bold("Verify")} (recomputed here, anchor read from Solana)
                                  (not liquidity: its verdict is partly-verified by design)
 
   --json                         any verify command, as machine-readable output
+
+  Exit codes: 0 verified, 1 failed, 2 usage or refused argument,
+              3 not settled (not anchored yet, partly verified, or unresolved).
+  Only 0 means verified.
 
 ${c.bold("Read")}
   allocation                     today's buy proportions and why
@@ -452,7 +446,7 @@ async function main() {
         return cmdVerifyAll(render);
       }
       if (sub === "report") {
-        if (!arg) return usageError("verify report needs a month, like 2026-06-01");
+        if (!arg || !/^\d{4}-\d{2}-01$/.test(arg)) return usageError("verify report needs a month, like 2026-06-01");
         return render(await verifyReport(arg, V));
       }
       return usageError(`unknown: verify ${sub || ""}`.trim());
@@ -499,17 +493,23 @@ function finish(code) {
   process.exitCode = code;
 }
 
+// A verify command that could not finish has settled nothing: an endpoint that
+// did not answer is not evidence against the vault, so it exits 3 like any
+// other unsettled verdict, never 1, which a script would read as "the chain
+// contradicts the claim". Other commands keep 1 for a failure.
+const failureCode = () => (process.argv[2] === "verify" ? 3 : 1);
+
 main()
   .then((code) => finish(code ?? 0))
   .catch((err) => {
     if (err instanceof HttpError && err.status === 429) {
       console.error(c.yellow("Rate limited.") + " Wait a moment and try again.");
-      finish(1);
+      finish(failureCode());
       return;
     }
     // A shape change upstream should say "upgrade" rather than print a stack
     // trace or, worse, garbage that looks like data.
     console.error(c.red("Error:") + " " + (err?.message || String(err)));
     console.error(c.dim("  If this looks like a response-shape problem, upgrade: npm i -g vaultbags-cli@latest"));
-    finish(1);
+    finish(failureCode());
   });

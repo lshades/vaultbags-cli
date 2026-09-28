@@ -163,6 +163,25 @@ export function monthlyPayload({ period, metrics }) {
   return { v: 1, kind: "monthly-report", period, metrics: metrics ?? null };
 }
 
+// ---------------------------------------------------------------------------
+// The memo each record implies
+//
+// An anchor proves a record only if its memo is the one the record implies,
+// character for character, and every field of it is rebuilt here from what was
+// recomputed, never taken from the memo text the API published beside it. A
+// hash alone is not enough: a claims-day memo also carries the day and the
+// number of claims, and a stamp of the right root under the wrong day or count
+// is a different statement.
+
+export const claimsMemo = ({ period, count, root }) => `vaultbags:claims:v1:${period}:${count}:${root}`;
+
+export const decisionMemo = ({ date, weights, hash }) =>
+  `vaultbags:alloc:v1:${date}:g${weights?.gold}s${weights?.spyx}u${weights?.usdy}:${hash}`;
+
+export const strategyMemo = ({ date, strategyKey, hash }) => `vaultbags:strategy:v1:${date}:${strategyKey}:${hash}`;
+
+export const monthlyMemo = ({ period, hash }) => `vaultbags:monthly:v1:${period}:${hash}`;
+
 // The hash is always the last colon-separated field of the memo, whatever the
 // memo's shape, so reading it does not depend on counting fields.
 export function hashFromMemo(memo) {
