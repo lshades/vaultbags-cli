@@ -333,10 +333,14 @@ export async function getSignatureStatuses(signatures) {
   return out;
 }
 
+// Version 1 is a ceiling, not a filter: legacy and v0 read as before, and a
+// v1 transaction (live on mainnet since 2026-09-15) reads instead of failing
+// with -32015. A receipt's payment is built by the payer, so it can be any
+// version.
 export async function getTransaction(signature) {
   const { body, status } = await rpcCall("getTransaction", [
     signature,
-    { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 },
+    { encoding: "jsonParsed", maxSupportedTransactionVersion: 1 },
   ]);
   if (!body) throw new Error(status ? `RPC responded ${status}` : "RPC could not be reached");
   if (body.error) throw new Error(`RPC: ${body.error.message}`);
