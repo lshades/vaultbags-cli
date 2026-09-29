@@ -4,7 +4,7 @@
 // spec cannot drift apart without one suite going red.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { canonicalAssets, canonicalLeaf, hashLeaf, strategyPayload, canonicalStringify, sha256 } from "../src/canonical.js";
+import { canonicalAssets, canonicalLeaf, hashLeaf, buildRoot, strategyPayload, canonicalStringify, sha256 } from "../src/canonical.js";
 
 const M1 = "1".repeat(32);
 const M2 = "2".repeat(32);
@@ -67,4 +67,17 @@ test("strategy payload hashes to the app's reference vector", () => {
     sha256(canonicalStringify(strategyPayload(d))),
     "c7f06f664b03e61acad2b46e88174afae26ec86a174c85a0f78b840ab22f1a61"
   );
+});
+
+test("a claim record without its wallet, token or transaction does not hash", () => {
+  const base = { wallet: "w", tokenMint: "m", gold: "1", spyx: "0", usdy: "0", tx: "t" };
+  for (const k of ["wallet", "tokenMint", "tx"]) {
+    assert.throws(() => canonicalLeaf({ ...base, [k]: "" }), /missing its wallet, token mint or transaction/);
+  }
+});
+
+test("two records naming the same transaction are refused, not hashed", () => {
+  const a = { wallet: "w1", tokenMint: "m", gold: "1", spyx: "0", usdy: "0", tx: "same" };
+  const b = { wallet: "w2", tokenMint: "m", gold: "2", spyx: "0", usdy: "0", tx: "same" };
+  assert.throws(() => buildRoot([a, b]), /name the same transaction/);
 });

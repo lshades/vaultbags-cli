@@ -75,6 +75,9 @@ export function canonicalAssets(assets) {
 }
 
 export function canonicalLeaf({ wallet, tokenMint, gold, spyx, usdy, assets, tx }) {
+  // Same refusal as the protocol's lib/merkleCore: a record without its
+  // wallet, token or transaction is not a claim, and must not hash as one.
+  if (!wallet || !tokenMint || !tx) throw new Error("a claim record is missing its wallet, token mint or transaction");
   if (assets != null) {
     return ["v2", `w:${wallet}`, `m:${tokenMint}`, `a:${canonicalAssets(assets)}`, `t:${tx}`].join("|");
   }
@@ -106,6 +109,12 @@ export function foldProof(leaf, proof) {
 // pairwise, odd node carried up unchanged.
 export function buildRoot(leaves) {
   const sorted = [...leaves].sort((a, b) => (a.tx < b.tx ? -1 : a.tx > b.tx ? 1 : 0));
+  // A transaction pays one claim. Two records naming the same one would share
+  // a place in the tree, so, as in the protocol's lib/merkleCore, that set is
+  // refused rather than hashed.
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i].tx === sorted[i - 1].tx) throw new Error(`two claim records name the same transaction ${sorted[i].tx}`);
+  }
   let level = sorted.map(hashLeaf);
   if (level.length === 0) return null;
   while (level.length > 1) {
