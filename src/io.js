@@ -377,6 +377,9 @@ export async function getTransaction(signature) {
     logs,
     failed: !!tx.meta?.err,
     slot: tx.slot ?? null,
+    // When it landed, as the chain recorded it (unix seconds), or null when
+    // the RPC did not say. An anchor only counts if it landed at the time.
+    blockTime: Number.isFinite(tx.blockTime) ? tx.blockTime : null,
     tokenDeltas: tokenDeltasFromMeta(tx.meta),
   };
 }

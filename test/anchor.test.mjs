@@ -3,7 +3,8 @@
 // An anchor proves a record when three things hold, all read from the chain:
 // the transaction succeeded, the TREASURY signed it (pinned in this tool, never
 // named by the API), and it carries exactly the memo the recomputed record
-// implies. Each test below breaks one of those and expects the verdict to
+// implies, and it landed at the time (a later stamp is a backfill). Each test
+// below breaks one of those and expects the verdict to
 // notice, including the cases an earlier version let through: a signer the API
 // chose, a memo checked only by its trailing hash, a record for some other
 // claim or day, and a lock "ran" because a log line said the word.
@@ -23,6 +24,7 @@ import {
 } from "../src/canonical.js";
 import { programInstructions, memosFromTx, getOwnerBalances } from "../src/io.js";
 import { verifyAllocation, verifyClaim, verifyLiquidity, exitCodeFor, VERDICT } from "../src/verify.js";
+import { sameDayWindow, afterDayWindow, afterMonthWindow, landedInWindow } from "../src/anchorWindow.js";
 import { TREASURY, DAMM_V2_PROGRAM } from "../src/pinned.js";
 
 // Real anchors, read from mainnet on 2026-09-28 together with the fields
@@ -67,9 +69,13 @@ const json = (body) =>
 const FAKE_PROGRAM = "Fake" + "1".repeat(40);
 const OTHER_SIGNER = "signer:someone-else";
 
-function txResult({ signers = [TREASURY], memos = [], innerMemos = [], err = null, logs = [] } = {}) {
+// Unix seconds for an ISO time, for when a fabricated stamp landed.
+const at = (iso) => Math.floor(Date.parse(iso) / 1000);
+
+function txResult({ signers = [TREASURY], memos = [], innerMemos = [], err = null, logs = [], blockTime } = {}) {
   return {
     slot: 1,
+    ...(blockTime !== undefined ? { blockTime } : {}),
     meta: {
       err,
       logMessages: logs,
@@ -134,6 +140,8 @@ const decision = () => {
   return d;
 };
 const decisionMemoFor = (d) => decisionMemo({ date: d.date, weights: d.weights, hash: d.storedHash });
+// When the real decision for 2026-09-27 would land: early on its own day.
+const ON_THE_DAY = at("2026-09-27T00:05:00Z");
 
 async function runDecision(d, chain, date = d.date) {
   install([["/api/proof/decision/", d]], (method) => ({ result: method === "getTransaction" ? chain : null }));
@@ -146,15 +154,31 @@ async function runDecision(d, chain, date = d.date) {
 
 test("decision: the exact memo, signed by the treasury, verifies", async () => {
   const d = decision();
-  const r = await runDecision(d, txResult({ memos: [decisionMemoFor(d)] }));
+  const r = await runDecision(d, txResult({ memos: [decisionMemoFor(d)], blockTime: ON_THE_DAY }));
   assert.equal(r.verdict, VERDICT.VERIFIED);
+});
+
+test("decision: the exact memo stamped the day after is a backfill and fails", async () => {
+  const d = decision();
+  const r = await runDecision(d, txResult({ memos: [decisionMemoFor(d)], blockTime: at("2026-09-28T00:00:00Z") }));
+  assert.equal(r.verdict, VERDICT.FAILED);
+  assert.match(r.checks.at(-1).detail, /not on the day it decides/);
+});
+
+test("decision: a stamp whose landing time the RPC did not return is unresolved, not verified", async () => {
+  const d = decision();
+  const r = await runDecision(d, txResult({ memos: [decisionMemoFor(d)] }));
+  assert.equal(r.verdict, VERDICT.UNRESOLVED);
 });
 
 test("decision: the signer comes from this tool, not from the API", async () => {
   const d = decision();
   // No expectedSigner published: still fully checked, against the pinned one.
   const quiet = { ...d, expectedSigner: undefined };
-  assert.equal((await runDecision(quiet, txResult({ memos: [decisionMemoFor(d)] }))).verdict, VERDICT.VERIFIED);
+  assert.equal(
+    (await runDecision(quiet, txResult({ memos: [decisionMemoFor(d)], blockTime: ON_THE_DAY }))).verdict,
+    VERDICT.VERIFIED
+  );
   // The API naming its own signer, with a matching stamp from that signer:
   // the case a dishonest endpoint would build. It must fail.
   const named = { ...d, expectedSigner: OTHER_SIGNER };
@@ -176,7 +200,10 @@ test("decision: the right hash under other weights is a different statement", as
 
 test("decision: the expected memo among others is found; absent, it fails", async () => {
   const d = decision();
-  assert.equal((await runDecision(d, txResult({ memos: ["noise", decisionMemoFor(d)] }))).verdict, VERDICT.VERIFIED);
+  assert.equal(
+    (await runDecision(d, txResult({ memos: ["noise", decisionMemoFor(d)], blockTime: ON_THE_DAY }))).verdict,
+    VERDICT.VERIFIED
+  );
   assert.equal((await runDecision(d, txResult({ memos: ["noise"] }))).verdict, VERDICT.FAILED);
 });
 
@@ -199,7 +226,13 @@ const leafB = { wallet: "w:b", tokenMint: "m:x", gold: "0", spyx: "2", usdy: "0"
 const PERIOD = "2026-09-26";
 const ROOT = buildRoot([leafA, leafB]);
 
-async function runClaim(asked, { leaf = leafA, memo = claimsMemo({ period: PERIOD, count: 2, root: ROOT }) } = {}) {
+// The root for 2026-09-26 lands once that day is over.
+const AFTER_THE_DAY = at("2026-09-27T00:05:00Z");
+
+async function runClaim(
+  asked,
+  { leaf = leafA, memo = claimsMemo({ period: PERIOD, count: 2, root: ROOT }), blockTime = AFTER_THE_DAY } = {}
+) {
   const claim = {
     period: PERIOD,
     leaf,
@@ -214,7 +247,7 @@ async function runClaim(asked, { leaf = leafA, memo = claimsMemo({ period: PERIO
       ["/api/proof/claims/", { period: PERIOD, leaves: [leafA, leafB], root: ROOT }],
       ["/api/proof/claim/", claim],
     ],
-    (method) => ({ result: method === "getTransaction" ? txResult({ memos: [memo] }) : null })
+    (method) => ({ result: method === "getTransaction" ? txResult({ memos: [memo], blockTime }) : null })
   );
   try {
     return await verifyClaim(asked, OPTS);
@@ -242,6 +275,34 @@ test("claim: the right root stamped with another count or day fails", async () =
     (await runClaim("tx:a", { memo: claimsMemo({ period: "2026-09-25", count: 2, root: ROOT }) })).verdict,
     VERDICT.FAILED
   );
+});
+
+test("claim: a root stamped before its day was over fails", async () => {
+  const r = await runClaim("tx:a", { blockTime: at("2026-09-26T23:59:00Z") });
+  assert.equal(r.verdict, VERDICT.FAILED);
+  assert.match(r.checks.at(-1).detail, /not after the day it closes/);
+});
+
+test("claim: a root whose landing time is unknown is unresolved", async () => {
+  assert.equal((await runClaim("tx:a", { blockTime: null })).verdict, VERDICT.UNRESOLVED);
+});
+
+test("the landing windows, edge to edge", () => {
+  const day = sameDayWindow("2026-09-27");
+  assert.equal(landedInWindow(at("2026-09-27T00:00:00Z"), day).state, "ok");
+  assert.equal(landedInWindow(at("2026-09-27T23:59:59Z"), day).state, "ok");
+  assert.equal(landedInWindow(at("2026-09-28T00:00:00Z"), day).state, "fail");
+  assert.equal(landedInWindow(at("2026-09-26T23:59:59Z"), day).state, "fail");
+  const after = afterDayWindow("2026-09-26");
+  assert.equal(landedInWindow(at("2026-09-27T00:00:00Z"), after).state, "ok");
+  assert.equal(landedInWindow(at("2026-09-26T23:59:59Z"), after).state, "fail");
+  assert.equal(landedInWindow(at("2027-01-01T00:00:00Z"), after).state, "ok", "no upper bound: a late root is still after its day");
+  const month = afterMonthWindow("2026-12-01");
+  assert.equal(landedInWindow(at("2027-01-01T00:00:00Z"), month).state, "ok", "December closes into the next year");
+  assert.equal(landedInWindow(at("2026-12-31T23:59:59Z"), month).state, "fail");
+  assert.equal(landedInWindow(null, day).state, "unresolved");
+  assert.equal(landedInWindow(at("2026-09-27T01:00:00Z"), null).state, "unresolved");
+  assert.equal(sameDayWindow("2026-9-27"), null, "a date that is not YYYY-MM-DD gives no window");
 });
 
 test("claim: a malformed record fails as a check, not as a crash", async () => {

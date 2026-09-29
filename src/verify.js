@@ -38,6 +38,7 @@ import {
 } from "./io.js";
 import { decodeReceipt, verifyReceiptSignature, checkReceiptClaims } from "./receipt.js";
 import { TREASURY, DAMM_V2_PROGRAM } from "./pinned.js";
+import { sameDayWindow, afterDayWindow, afterMonthWindow, landedInWindow } from "./anchorWindow.js";
 
 export const VERDICT = {
   VERIFIED: "verified",
@@ -116,7 +117,9 @@ const trimZeros = (s) => (s.includes(".") ? s.replace(/(\.\d*?)0+$/, "$1").repla
 // carries exactly the memo the record implies, rebuilt here from what was
 // recomputed. The API may say which signer it expects; if that disagrees with
 // the pinned one, the API is contradicting the tool, and that is a failure.
-async function checkAnchor(checks, { receiptTx, expectedMemo, apiSigner }) {
+// And it landed at the time (src/anchorWindow): the right memo stamped later is
+// a backfill, which is exactly what an anchor exists to rule out.
+async function checkAnchor(checks, { receiptTx, expectedMemo, apiSigner, window }) {
   let tx;
   try {
     tx = await getTransaction(receiptTx);
@@ -157,7 +160,11 @@ async function checkAnchor(checks, { receiptTx, expectedMemo, apiSigner }) {
       memoOk ? expectedMemo : `expected ${expectedMemo}; the chain carries ${tx.memos.join(" | ") || "no memo"}`
     )
   );
-  return memoOk ? VERDICT.VERIFIED : VERDICT.FAILED;
+  if (!memoOk) return VERDICT.FAILED;
+
+  const landed = landedInWindow(tx.blockTime, window);
+  checks.push(check("stamped at the time, not backfilled later", landed.state, landed.detail));
+  return landed.state === "ok" ? VERDICT.VERIFIED : landed.state === "fail" ? VERDICT.FAILED : VERDICT.UNRESOLVED;
 }
 
 // Hashing a published record throws on a malformed amount. That is the record
@@ -244,6 +251,7 @@ export async function verifyClaim(tx, opts) {
     receiptTx: claim.receiptTx,
     expectedMemo: claimsMemo({ period: claim.period, count: dayLeaves.length, root: rebuilt }),
     apiSigner: claim.expectedSigner || null,
+    window: afterDayWindow(claim.period),
   });
   const verdict = recordsOk ? anchor : VERDICT.FAILED;
   return { verdict, checks, extra: { period: claim.period, receiptTx: claim.receiptTx } };
@@ -280,6 +288,7 @@ export async function verifyAllocation(date, opts) {
     receiptTx: d.receiptTx,
     expectedMemo: decisionMemo({ date: d.date, weights: d.weights, hash: localHash }),
     apiSigner: d.expectedSigner,
+    window: sameDayWindow(d.date),
   });
   return {
     verdict: selfOk ? anchor : VERDICT.FAILED,
@@ -341,6 +350,7 @@ export async function verifyStrategy(id, date, opts) {
     receiptTx: d.receiptTx,
     expectedMemo: strategyMemo({ date: d.date, strategyKey: d.strategyKey, hash: localHash }),
     apiSigner: d.expectedSigner,
+    window: sameDayWindow(d.date),
   });
   return {
     verdict: selfOk ? anchor : VERDICT.FAILED,
@@ -606,6 +616,7 @@ export async function verifyReport(period, opts) {
     receiptTx,
     expectedMemo: monthlyMemo({ period: monthPeriod, hash: localHash }),
     apiSigner: r.expectedSigner ?? null,
+    window: afterMonthWindow(monthPeriod),
   });
   return { verdict: selfOk ? anchor : VERDICT.FAILED, checks, extra: { period: monthPeriod } };
 }
@@ -953,6 +964,7 @@ export async function verifyLatestDay(opts) {
     receiptTx: day.receiptTx,
     expectedMemo: claimsMemo({ period: day.period, count: dayLeaves.length, root: rebuilt }),
     apiSigner: day.expectedSigner ?? null,
+    window: afterDayWindow(day.period),
   });
   return { verdict: rootOk ? anchor : VERDICT.FAILED, checks, extra: { period: day.period } };
 }
