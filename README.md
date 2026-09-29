@@ -79,6 +79,8 @@ There is no command here that needs one, and the refusal is active rather than m
 
 That is not about protecting this tool, which cannot sign anything regardless. It is about the habit. A CLI that quietly swallows a pasted key teaches people that pasting keys into terminals is normal, and that habit is what produces the next drained wallet.
 
+One argument has a key's shape by design: a strategy key is 64 hex characters, exactly what a 32-byte private key looks like written in hex. `verify strategy` and `get strategy --strategy=` accept one only when it is on the public list of strategies, which the tool reads first with a request that carries nothing you typed. Anything not on that list is refused like any other key and never sent, and a preset name (`classic`, `growth`, `hard-money`, `income`) always works.
+
 A key already sitting in your environment is a different case, and it gets a warning rather than a refusal. It was almost certainly put there by another project, nothing here reads it, and refusing to run a read-only command over it would break the tool on exactly the machines most likely to run it while protecting nobody.
 
 If you need to move funds or claim, do it in your wallet at [vaultbags.app](https://vaultbags.app).

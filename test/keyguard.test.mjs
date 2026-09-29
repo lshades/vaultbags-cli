@@ -9,7 +9,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { refuseSecretArgs, warnSecretEnv, looksLikeSecret, looksLikeMnemonic } from "../src/keyguard.js";
+import { refuseSecretArgs, warnSecretEnv, looksLikeSecret, looksLikeMnemonic, strategyKeyCandidates } from "../src/keyguard.js";
 
 // Structurally shaped like the real things, generated for this test, never used.
 const FAKE_BASE58_KEY = "5".repeat(88);
@@ -165,4 +165,33 @@ test("non-strings never trip it", () => {
   assert.equal(looksLikeSecret(undefined), false);
   assert.equal(looksLikeSecret(12345), false);
   assert.equal(refuseSecretArgs([null, undefined, 5]).refuse, false);
+});
+
+// A strategy key and a 32-byte private key in hex have the same shape. The key
+// in a strategy position is exempted only when the caller found it on the public
+// list, which it reads without sending the value (bin/vaultbags.js).
+const STRATEGY_KEY_SHAPE = "c7f0".repeat(16); // 64 lowercase hex, generated here
+
+test("a 64-hex value in a strategy key's position is a candidate, nowhere else", () => {
+  assert.deepEqual(strategyKeyCandidates(["verify", "strategy", STRATEGY_KEY_SHAPE]), [STRATEGY_KEY_SHAPE]);
+  assert.deepEqual(strategyKeyCandidates(["verify", "strategy", STRATEGY_KEY_SHAPE, "2026-09-01", "--json"]), [STRATEGY_KEY_SHAPE]);
+  assert.deepEqual(strategyKeyCandidates(["get", "strategy", `--strategy=${STRATEGY_KEY_SHAPE}`]), [STRATEGY_KEY_SHAPE]);
+  assert.deepEqual(strategyKeyCandidates(["verify", "claim", STRATEGY_KEY_SHAPE]), []);
+  assert.deepEqual(strategyKeyCandidates(["ask", STRATEGY_KEY_SHAPE]), []);
+  assert.deepEqual(strategyKeyCandidates(["verify", "strategy", STRATEGY_KEY_SHAPE.toUpperCase()]), []);
+  assert.deepEqual(strategyKeyCandidates(["verify", "strategy", "classic"]), []);
+});
+
+test("a strategy key the public list names passes; one it does not name is refused", () => {
+  const argv = ["verify", "strategy", STRATEGY_KEY_SHAPE];
+  assert.equal(refuseSecretArgs(argv).refuse, true);
+  assert.equal(refuseSecretArgs(argv, { signatureArgs: [STRATEGY_KEY_SHAPE] }).refuse, false);
+  const flag = ["get", "strategy", `--strategy=${STRATEGY_KEY_SHAPE}`];
+  assert.equal(refuseSecretArgs(flag).refuse, true);
+  assert.equal(refuseSecretArgs(flag, { signatureArgs: [STRATEGY_KEY_SHAPE] }).refuse, false);
+});
+
+test("exempting a strategy key never exempts a seed phrase or a keypair array beside it", () => {
+  const r = refuseSecretArgs(["verify", "strategy", STRATEGY_KEY_SHAPE, FAKE_BYTE_ARRAY], { signatureArgs: [STRATEGY_KEY_SHAPE] });
+  assert.equal(r.refuse, true);
 });

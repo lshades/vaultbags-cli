@@ -12,7 +12,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { refuseSecretArgs, warnSecretEnv, REFUSAL_ADVICE } from "../src/keyguard.js";
+import { refuseSecretArgs, warnSecretEnv, strategyKeyCandidates, REFUSAL_ADVICE } from "../src/keyguard.js";
 import { verifyClaim, verifyAllocation, verifyStrategy, verifyReport, verifyReserves, verifyLatestDay, verifyPayouts,
   verifyLiquidity, verifyReceipt, latestClosedMonth, exitCodeFor, VERDICT } from "../src/verify.js";
 import { apiGet, apiPost, base, rpc, HttpError, DEFAULT_RPC } from "../src/io.js";
@@ -377,12 +377,38 @@ async function main() {
   const JWT_SHAPE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
   const signatureArgs =
     cmd === "verify" && arg && (sub === "claim" || (sub === "receipt" && JWT_SHAPE.test(arg))) ? [arg] : [];
+  // A strategy key has a private key's shape (see strategyKeyCandidates). It is
+  // exempt only when the public list of strategies names it, and that list is
+  // read first with a request that carries nothing that was typed, so a private
+  // key pasted in this position is refused and never sent. Without the list
+  // (offline, or the API is down) nothing is exempted and the preset name,
+  // which never looks like a key, still works.
+  const strategyArgs = strategyKeyCandidates(argv);
+  let publishedStrategies = null;
+  if (strategyArgs.length) {
+    try {
+      const list = await apiGet("/api/agent/strategies", V);
+      publishedStrategies = new Set((list?.strategies || []).map((s) => s?.key).filter((k) => typeof k === "string"));
+    } catch {
+      publishedStrategies = null;
+    }
+  }
+  const knownStrategyArgs = publishedStrategies ? strategyArgs.filter((k) => publishedStrategies.has(k)) : [];
   // The refusal runs before anything else, including help, so a mistyped paste
   // is caught by the first thing that reads it.
-  const refusal = refuseSecretArgs(argv, { signatureArgs });
+  const refusal = refuseSecretArgs(argv, { signatureArgs: [...signatureArgs, ...knownStrategyArgs] });
   if (refusal.refuse) {
     console.error(c.red(c.bold("Refused.")) + " " + refusal.reason);
     for (const line of REFUSAL_ADVICE) console.error(c.dim("  " + line));
+    if (strategyArgs.length > knownStrategyArgs.length) {
+      console.error(
+        c.dim(
+          publishedStrategies
+            ? "  If you meant a strategy key: it is not one the vault publishes (vaultbags get strategies lists them). A preset name (classic, growth, hard-money, income) always works."
+            : "  If you meant a strategy key: the list of strategies could not be read to confirm it. Use the preset name, or try again."
+        )
+      );
+    }
     return 2;
   }
 

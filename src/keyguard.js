@@ -96,6 +96,28 @@ const MNEMONIC_REASON =
   "That looks like a seed phrase. This tool never accepts one, and never signs anything. If it was a question, rephrase it or add punctuation.";
 const KEY_REASON = "That looks like a private key. This tool never accepts one, and never signs anything.";
 
+// A vault strategy's key is 64 lowercase hex: exactly the shape a 32-byte
+// private key takes when written in hex, so nothing about the value tells the
+// two apart. These are the arguments that ARE in a strategy key's position
+// (`verify strategy <key>`, `get <tool> --strategy=<key>`). They are not
+// exempted here: the caller reads the public list of strategies first, without
+// sending this value anywhere, and exempts only a value that list names. A
+// value it does not name is refused like any other and never leaves the
+// machine.
+const STRATEGY_KEY = /^[0-9a-f]{64}$/;
+export function strategyKeyCandidates(argv = []) {
+  const words = argv.filter((a) => typeof a === "string" && !a.startsWith("-"));
+  const out = [];
+  if (words[0] === "verify" && words[1] === "strategy" && STRATEGY_KEY.test(words[2] || "")) out.push(words[2]);
+  if (words[0] === "get") {
+    for (const a of argv) {
+      const m = typeof a === "string" ? a.match(/^--strategy=([0-9a-f]{64})$/) : null;
+      if (m) out.push(m[1]);
+    }
+  }
+  return out;
+}
+
 export function refuseSecretArgs(argv = [], { signatureArgs = [] } = {}) {
   const allowed = new Set(signatureArgs);
 
