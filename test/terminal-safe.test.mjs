@@ -51,5 +51,5 @@ test("the human printers pass remote values through it", () => {
   assert.match(bin, /c\.dim\(t\(ch\.detail\)\)/);
   assert.match(bin, /json\?\.answer \? t\(json\.answer\)/);
   assert.match(bin, /t\(d\.rationale\)/);
-  assert.match(bin, /t\(err\?\.message/);
+  assert.match(bin, /c\.red\("Error:"\) \+ " " \+ t\(message\)/);
 });

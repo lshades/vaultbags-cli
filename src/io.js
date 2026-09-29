@@ -53,10 +53,25 @@ export function terminalSafe(value) {
 }
 
 export class HttpError extends Error {
-  constructor(status, path) {
-    super(`${redactPath(path)} responded ${status}`);
+  // `detail` is the server's own reason when it gave one (the `error` field of
+  // a JSON body), so a refused request says why instead of only its status.
+  constructor(status, path, detail = null) {
+    super(`${redactPath(path)} responded ${status}${detail ? `: ${detail}` : ""}`);
     this.name = "HttpError";
     this.status = status;
+    this.detail = detail;
+  }
+}
+
+// The reason a refusing server gave, if its body says one. Bounded, and never
+// allowed to throw: a body that is not JSON simply has no reason to report.
+async function reasonFrom(res) {
+  try {
+    const body = await res.json();
+    const r = typeof body?.error === "string" ? body.error : typeof body?.message === "string" ? body.message : null;
+    return r ? r.slice(0, 300) : null;
+  } catch {
+    return null;
   }
 }
 
@@ -86,7 +101,7 @@ export async function apiGet(path, { version = "0.0.0" } = {}) {
     throw asReadable(e, base());
   }
   if (res.status === 429) throw new HttpError(429, path);
-  if (!res.ok) throw new HttpError(res.status, path);
+  if (!res.ok) throw new HttpError(res.status, path, await reasonFrom(res));
   // A body that is not JSON means something other than the API answered: a
   // captive portal, a proxy, an error page. Saying so beats a parser error.
   try {
@@ -110,7 +125,7 @@ export async function apiPost(path, body, { version = "0.0.0" } = {}) {
   }
   if (res.status === 429) throw new HttpError(429, path);
   // 402 carries the payment terms and is a legitimate answer, not a failure.
-  if (!res.ok && res.status !== 402) throw new HttpError(res.status, path);
+  if (!res.ok && res.status !== 402) throw new HttpError(res.status, path, await reasonFrom(res));
   return { status: res.status, json: await res.json().catch(() => null) };
 }
 

@@ -533,14 +533,34 @@ const failureCode = () => (process.argv[2] === "verify" ? 3 : 1);
 main()
   .then((code) => finish(code ?? 0))
   .catch((err) => {
+    const message = err instanceof HttpError && err.status === 429 ? "rate limited; wait a moment and try again" : err?.message || String(err);
+    // --json promises machine-readable output in every case, a failure
+    // included, so a script never has to parse prose. A verify command that
+    // could not run is unresolved, exactly as `verify all` reports a section
+    // that errored; the exit code is the same one the human path gives.
+    if (process.argv.some((a) => a === "--json" || a.startsWith("--json="))) {
+      const status = err instanceof HttpError ? err.status : undefined;
+      const out =
+        process.argv[2] === "verify"
+          ? { verdict: VERDICT.UNRESOLVED, ok: false, checks: [{ label: "could not run", state: "unresolved", detail: message }] }
+          : { ok: false, error: message, ...(status ? { status } : {}) };
+      console.log(JSON.stringify(out, null, 2));
+      finish(failureCode());
+      return;
+    }
     if (err instanceof HttpError && err.status === 429) {
       console.error(c.yellow("Rate limited.") + " Wait a moment and try again.");
       finish(failureCode());
       return;
     }
-    // A shape change upstream should say "upgrade" rather than print a stack
-    // trace or, worse, garbage that looks like data.
-    console.error(c.red("Error:") + " " + t(err?.message || String(err)));
-    console.error(c.dim("  If this looks like a response-shape problem, upgrade: npm i -g vaultbags-cli@latest"));
+    console.error(c.red("Error:") + " " + t(message));
+    // Only a response this version cannot read is a reason to upgrade. A 404
+    // (no record for that date or transaction) or a refused request is an
+    // answer, and sending someone to reinstall over it points the wrong way.
+    if (err instanceof TypeError) {
+      console.error(c.dim("  This looks like a response-shape problem; upgrade: npm i -g vaultbags-cli@latest"));
+    } else if (err instanceof HttpError && err.status === 404) {
+      console.error(c.dim("  Nothing is on record for that; check the date, transaction or name."));
+    }
     finish(failureCode());
   });
