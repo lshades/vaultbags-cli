@@ -9,7 +9,9 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { refuseSecretArgs, warnSecretEnv, looksLikeSecret, looksLikeMnemonic, strategyKeyCandidates } from "../src/keyguard.js";
+import { BIP39_ENGLISH } from "../src/bip39English.js";
 
 // Structurally shaped like the real things, generated for this test, never used.
 const FAKE_BASE58_KEY = "5".repeat(88);
@@ -92,13 +94,40 @@ test("naming a flag does not launder a secret into an unrelated field", () => {
   assert.equal(refuseSecretArgs(["get", "x", `--mint=${FAKE_BASE58_KEY}`]).refuse, true);
 });
 
-test("a refused seed phrase admits it might have been a question", () => {
-  // A dozen short lowercase words with no punctuation is also the shape of a
-  // sentence, and without the wordlist the two cannot be told apart. Refusing
-  // is right; accusing someone of pasting a key is not.
-  const r = refuseSecretArgs(["ask", "explain what the vault bought today and why gold fell hard again"]);
+test("the wordlist is BIP39 English, exactly", () => {
+  // Pinned so an edit to the list cannot pass unnoticed: 2048 words, in order,
+  // hashed joined by newlines (the digest the file's header records).
+  assert.equal(BIP39_ENGLISH.length, 2048);
+  assert.equal(
+    createHash("sha256").update(BIP39_ENGLISH.join("\n")).digest("hex"),
+    "187db04a869dd9bc7be80d21a86497d692c0db6abd3aa8cb6be5d618ff757fae"
+  );
+});
+
+test("a long ordinary question is not taken for a seed phrase", () => {
+  // Twelve short lowercase words used to be enough to refuse. Sentences are held
+  // together by words that are not on the list ("the", "and", "how", "does").
+  for (const q of [
+    "explain what the vault bought today and why gold fell hard again",
+    "ask how much gold does the vault hold today and what share goes where?",
+  ]) {
+    assert.equal(looksLikeSecret(q), false, q);
+    assert.equal(refuseSecretArgs(["ask", ...q.split(" ")]).refuse, false, q);
+  }
+});
+
+test("a refused seed phrase still allows that it might have been a question", () => {
+  const r = refuseSecretArgs(["ask", FAKE_MNEMONIC]);
   assert.equal(r.refuse, true);
   assert.match(r.reason, /if it was a question/i);
+});
+
+test("a numbered or punctuated seed phrase is refused", () => {
+  const w = FAKE_MNEMONIC.split(" ");
+  const numbered = w.map((x, i) => `${i + 1}. ${x}`).join(" ");
+  assert.equal(looksLikeSecret(numbered), true);
+  assert.equal(refuseSecretArgs(["ask", ...numbered.split(" ")]).refuse, true);
+  assert.equal(looksLikeSecret(w.join(", ")), true);
 });
 
 test("a claim signature is NOT refused when it is the signature argument", () => {
@@ -157,7 +186,7 @@ test("an ordinary unquoted question still passes", () => {
 
 test("a mint address is not mistaken for a key", () => {
   // Mints are base58 but well short of a 64-byte secret.
-  assert.equal(looksLikeSecret("4iCRYJHvwUcAJHrfEBQZ8mkPzRhcvW3rXk9AWuNPuMPS"), false);
+  assert.equal(looksLikeSecret("M".repeat(44)), false);
 });
 
 test("non-strings never trip it", () => {

@@ -16,6 +16,8 @@
 // and a re-run; a false negative means a secret was accepted, echoed into shell
 // history, and possibly printed back in an error. The costs are not comparable.
 
+import { BIP39_ENGLISH } from "./bip39English.js";
+
 // Base58 without the ambiguous characters, in the length range Solana secret
 // keys land in. A 64-byte secret key encodes to about 87-88 characters; the
 // range starts lower so a truncated or re-encoded paste is still caught.
@@ -25,32 +27,44 @@ const HEX_SECRET = /^(0x)?[0-9a-fA-F]{64,128}$/;
 // A JSON byte array, which is how Solana keypair files are stored on disk.
 const BYTE_ARRAY = /^\s*\[\s*\d{1,3}\s*(,\s*\d{1,3}\s*){31,}\]\s*$/;
 
-// The BIP39 English wordlist is 2048 words; carrying it here would be a
-// dependency and a distraction. A mnemonic is recognised by shape instead:
-// several lowercase alphabetic words in the counts BIP39 actually uses.
+// A mnemonic is recognised by its words, not by their shape. Shape alone (a
+// dozen lowercase words of three to eight letters) is also the shape of an
+// ordinary question, and the guard refused those. Every word of a BIP39 phrase
+// is on the list, and a sentence nearly never strings twelve of them together,
+// because the words that hold a sentence up ("the", "and", "how", "does") are
+// not on it.
+const BIP39 = new Set(BIP39_ENGLISH);
 const MNEMONIC_LENGTHS = new Set([12, 15, 18, 21, 24]);
+
+// A word as typed, without the punctuation around it ("abandon," or "1.abandon"
+// read as "abandon"). A token with no letters at all, like the "1." of a
+// numbered list, is empty.
+function bareWord(token) {
+  return token.toLowerCase().replace(/^[^a-z]+|[^a-z]+$/g, "");
+}
 
 export function looksLikeMnemonic(value) {
   if (typeof value !== "string") return false;
-  const words = value.trim().toLowerCase().split(/\s+/);
+  const words = value.trim().split(/\s+/).map(bareWord).filter(Boolean);
   if (!MNEMONIC_LENGTHS.has(words.length)) return false;
-  return words.every((w) => /^[a-z]{3,8}$/.test(w));
+  return words.every((w) => BIP39.has(w));
 }
 
-// A seed phrase INSIDE a longer text: twelve or more mnemonic-shaped words in a
-// row, anywhere. Checking only a whole value of exactly 12/15/18/21/24 words
-// missed the phrase with a word of context around it, and missed it entirely
-// when typed without quotes: then every word is its own argument, none of them
-// looks like anything, and `ask` joins them back into a question and sends it
-// to a server. Every BIP39 word has three to eight letters, so a real phrase
-// always forms such a run; a sentence rarely does, because short words ("a",
-// "is", "to") and punctuation break it.
+// A seed phrase INSIDE a longer text: twelve or more list words in a row,
+// anywhere. Checking only a whole value of exactly 12/15/18/21/24 words missed
+// the phrase with a word of context around it, and missed it entirely when
+// typed without quotes: then every word is its own argument, none of them looks
+// like anything, and `ask` joins them back into a question and sends it to a
+// server. Numbering between the words ("1. abandon 2. ability") does not break
+// the run; a word that is not on the list does.
 const MNEMONIC_RUN = 12;
 export function containsMnemonic(value) {
   if (typeof value !== "string") return false;
   let run = 0;
-  for (const w of value.trim().toLowerCase().split(/\s+/)) {
-    run = /^[a-z]{3,8}$/.test(w) ? run + 1 : 0;
+  for (const token of value.trim().split(/\s+/)) {
+    const w = bareWord(token);
+    if (!w) continue;
+    run = BIP39.has(w) ? run + 1 : 0;
     if (run >= MNEMONIC_RUN) return true;
   }
   return false;
@@ -88,12 +102,10 @@ const PUBLIC_ID_FLAG = /^--?(tx|txid|signature|sig|hash|root)(=|$)/i;
 // transaction signature is the core argument of the core command. The caller
 // marks which positions are signatures so the guard can tell "the thing you are
 // verifying" from "a secret you should never have typed".
-// A question can trip the seed-phrase check: a dozen short lowercase words with
-// no punctuation is also the shape of a seed phrase, and the two cannot be told
-// apart without the wordlist. So the message covers both readings rather than
-// accusing someone of pasting a key.
+// Twelve BIP39 words in a row is a seed phrase in all but the rarest sentence,
+// and the message still allows for that one rather than accusing anyone.
 const MNEMONIC_REASON =
-  "That looks like a seed phrase. This tool never accepts one, and never signs anything. If it was a question, rephrase it or add punctuation.";
+  "That looks like a seed phrase. This tool never accepts one, and never signs anything. If it was a question, reword it.";
 const KEY_REASON = "That looks like a private key. This tool never accepts one, and never signs anything.";
 
 // A vault strategy's key is 64 lowercase hex: exactly the shape a 32-byte
