@@ -15,7 +15,12 @@ import { dirname, join } from "node:path";
 import { refuseSecretArgs, warnSecretEnv, strategyKeyCandidates, REFUSAL_ADVICE } from "../src/keyguard.js";
 import { verifyClaim, verifyAllocation, verifyStrategy, verifyReport, verifyReserves, verifyLatestDay, verifyPayouts,
   verifyLiquidity, verifyReceipt, latestClosedMonth, exitCodeFor, VERDICT } from "../src/verify.js";
-import { apiGet, apiPost, base, rpc, HttpError, DEFAULT_RPC } from "../src/io.js";
+import { apiGet, apiPost, base, rpc, HttpError, DEFAULT_RPC, terminalSafe } from "../src/io.js";
+
+// Every value that came from the API or the chain passes through this before a
+// person reads it (see terminalSafe): the colors are this tool's own, applied
+// after, so what is printed can never carry a control sequence it was sent.
+const t = terminalSafe;
 
 const pkg = JSON.parse(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8")
@@ -76,8 +81,8 @@ function printJson(result) {
 
 function printChecks(result) {
   for (const ch of result.checks) {
-    console.log(`  ${MARK[ch.state] || ch.state}  ${ch.label}`);
-    if (ch.detail) console.log(`        ${c.dim(ch.detail)}`);
+    console.log(`  ${MARK[ch.state] || t(ch.state)}  ${t(ch.label)}`);
+    if (ch.detail) console.log(`        ${c.dim(t(ch.detail))}`);
   }
   console.log("");
   switch (result.verdict) {
@@ -107,7 +112,7 @@ function printChecks(result) {
         c.yellow(c.bold("UNRESOLVED")) +
           " something above could not be settled either way, so it counts as neither pass nor fail."
       );
-      if (result.hint) console.log(c.dim("  " + result.hint));
+      if (result.hint) console.log(c.dim("  " + t(result.hint)));
       break;
     default:
       console.log(c.red(c.bold("VERIFICATION FAILED")));
@@ -124,12 +129,12 @@ const fmtUsd = (n) =>
 
 async function cmdAllocation() {
   const d = await apiGet("/api/agent/todays-allocation", V);
-  console.log(c.bold(`Today's buy, ${d.date || "today"}`));
-  console.log(`  gold ${d.weights?.gold}%   SPYx ${d.weights?.spyx}%   USDY ${d.weights?.usdy}%`);
-  if (d.band) console.log(c.dim(`  band ${d.band.min}-${d.band.max}% per asset`));
-  if (d.rationale) console.log(`\n  ${d.rationale}`);
-  if (d.receiptTx) console.log(c.dim(`\n  receipt ${d.receiptTx}`));
-  console.log(c.dim(`  verify it: vaultbags verify allocation ${d.date || ""}`.trimEnd()));
+  console.log(c.bold(`Today's buy, ${t(d.date || "today")}`));
+  console.log(`  gold ${t(d.weights?.gold)}%   SPYx ${t(d.weights?.spyx)}%   USDY ${t(d.weights?.usdy)}%`);
+  if (d.band) console.log(c.dim(`  band ${t(d.band.min)}-${t(d.band.max)}% per asset`));
+  if (d.rationale) console.log(`\n  ${t(d.rationale)}`);
+  if (d.receiptTx) console.log(c.dim(`\n  receipt ${t(d.receiptTx)}`));
+  console.log(c.dim(`  verify it: vaultbags verify allocation ${t(d.date || "")}`.trimEnd()));
   return 0;
 }
 
@@ -137,12 +142,12 @@ async function cmdTreasury() {
   const d = await apiGet("/api/agent/treasury-stats", V);
   console.log(c.bold("Treasury"));
   for (const a of d.assets || []) {
-    const label = String(a.name || a.symbol || "").replace(/^\$/, "");
-    console.log(`  ${label.padEnd(6)} ${fmtUsd(a.valueUsd).padStart(12)}  ${c.dim(String(a.balance ?? ""))}`);
+    const label = t(a.name || a.symbol || "").replace(/^\$/, "");
+    console.log(`  ${label.padEnd(6)} ${fmtUsd(a.valueUsd).padStart(12)}  ${c.dim(t(a.balance ?? ""))}`);
   }
   if (d.totalValueUsd != null) console.log(`  ${"total".padEnd(6)} ${c.bold(fmtUsd(d.totalValueUsd).padStart(12))}`);
   if (d.totalPaidToHoldersUsd != null) console.log(c.dim(`\n  paid to holders ${fmtUsd(d.totalPaidToHoldersUsd)}`));
-  if (d.cyclesCount != null) console.log(c.dim(`  cycles ${d.cyclesCount}   holders ${d.holdersCount ?? "?"}`));
+  if (d.cyclesCount != null) console.log(c.dim(`  cycles ${t(d.cyclesCount)}   holders ${t(d.holdersCount ?? "?")}`));
   return 0;
 }
 
@@ -151,8 +156,8 @@ async function cmdReserves() {
   const reserves = d.reserves || [];
   console.log(c.bold(`Proof of Reserves  ${fmtUsd(d.totalReservesUsd)}`));
   for (const r of reserves) {
-    const label = String(r.name || r.symbol || "").replace(/^\$/, "");
-    console.log(`  ${label.padEnd(6)} ${fmtUsd(r.valueUsd).padStart(12)}  ${c.dim(r.mint || "")}`);
+    const label = t(r.name || r.symbol || "").replace(/^\$/, "");
+    console.log(`  ${label.padEnd(6)} ${fmtUsd(r.valueUsd).padStart(12)}  ${c.dim(t(r.mint || ""))}`);
   }
   console.log(c.dim("\n  Every mint and wallet here is public. Check any of them on Solscan yourself."));
   return 0;
@@ -166,10 +171,10 @@ async function cmdBrainVsFlat() {
   }
   const pct = (v) => (Number.isFinite(v) ? `${(v * 100).toFixed(2)}%` : "n/a");
   const days = d.daysMeasured ?? d.nDays;
-  console.log(c.bold(`The daily line vs an even split${days != null ? `, ${days} days` : ""}`));
+  console.log(c.bold(`The daily line vs an even split${days != null ? `, ${t(days)} days` : ""}`));
   console.log(`  brain ${pct(d.brainReturn)}   even ${pct(d.flatReturn)}   edge ${pct(d.edge)}`);
   if (d.hasVerdict === false && d.daysNeededForVerdict) {
-    console.log(c.dim(`  Still accumulating; a verdict is held until ${d.daysNeededForVerdict} days.`));
+    console.log(c.dim(`  Still accumulating; a verdict is held until ${t(d.daysNeededForVerdict)} days.`));
   }
   console.log(c.dim("  Reported win or lose."));
   return 0;
@@ -182,8 +187,8 @@ async function cmdAsk(question) {
     console.log(c.dim("  This tool does not pay: it never handles keys. Ask again tomorrow, or use the site."));
     return 1;
   }
-  console.log(json?.answer || "(no answer)");
-  if (json?.lane) console.log(c.dim(`\n  lane: ${json.lane}`));
+  console.log(json?.answer ? t(json.answer) : "(no answer)");
+  if (json?.lane) console.log(c.dim(`\n  lane: ${t(json.lane)}`));
   return 0;
 }
 
@@ -201,10 +206,10 @@ async function cmdTools() {
   let paid = 0;
   for (const p of paths) {
     const op = spec.paths[p].get || spec.paths[p].post || {};
-    const name = p.replace("/api/agent/", "");
+    const name = t(p.replace("/api/agent/", ""));
     const tag = isPaidOp(op) ? c.yellow(" paid") : "";
     if (tag) paid++;
-    console.log(`  ${name.padEnd(24)} ${c.dim((op.summary || "").slice(0, 70))}${tag}`);
+    console.log(`  ${name.padEnd(24)} ${c.dim(t(op.summary || "").slice(0, 70))}${tag}`);
   }
   console.log(c.dim("\n  Any of them: vaultbags get <tool> [--param=value]"));
   if (paid) console.log(c.dim("  Paid ones answer with their terms; this tool never pays, it never handles keys."));
@@ -535,7 +540,7 @@ main()
     }
     // A shape change upstream should say "upgrade" rather than print a stack
     // trace or, worse, garbage that looks like data.
-    console.error(c.red("Error:") + " " + (err?.message || String(err)));
+    console.error(c.red("Error:") + " " + t(err?.message || String(err)));
     console.error(c.dim("  If this looks like a response-shape problem, upgrade: npm i -g vaultbags-cli@latest"));
     finish(failureCode());
   });

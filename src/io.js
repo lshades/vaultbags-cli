@@ -40,6 +40,18 @@ export function redact(value) {
 
 const redactPath = (path) => String(path ?? "").split("/").map(redact).join("/");
 
+// Text that came from outside (the API, the chain) is printed with its control
+// characters removed: C0 except tab and newline, DEL, C1, and the Unicode
+// bidirectional controls. An escape or a control sequence in a server's string
+// could otherwise move the cursor, hide the lines after it, or paint a green
+// VERIFIED this tool never printed. The verdict and the exit code never depend
+// on printed text, and --json is unaffected (JSON escapes these characters),
+// so this only keeps what a person reads honest.
+const TERMINAL_UNSAFE = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+export function terminalSafe(value) {
+  return String(value ?? "").replace(TERMINAL_UNSAFE, "");
+}
+
 export class HttpError extends Error {
   constructor(status, path) {
     super(`${redactPath(path)} responded ${status}`);
