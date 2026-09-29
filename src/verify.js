@@ -1015,8 +1015,19 @@ export async function verifyReceipt(jwt, opts) {
   checks.push(check("signed by the issuer's published key", sig.ok ? "ok" : "fail", sig.ok ? `RS256, key ${sig.kid}` : sig.reason));
   if (!sig.ok) return { verdict: VERDICT.FAILED, checks };
 
+  // A receipt past its expiry keeps being checked: its signature already held,
+  // and the chain can still say whether the payment happened. It can never be
+  // VERIFIED, because a lapsed receipt no longer stands as a live proof, so the
+  // best it reaches is partly verified. Any other claim that does not hold is
+  // a failure, as before.
   let claimsFailed = false;
+  let expired = false;
   for (const c of checkReceiptClaims(claims)) {
+    if (!c.ok && c.expired) {
+      expired = true;
+      checks.push(check(c.label, "unresolved", c.detail));
+      continue;
+    }
     checks.push(check(c.label, c.ok ? "ok" : "fail", c.detail));
     if (!c.ok) claimsFailed = true;
   }
@@ -1094,6 +1105,10 @@ export async function verifyReceipt(jwt, opts) {
   checks.push(check("paid to the wallet the vault advertises for payment", termsState, termsDetail));
 
   const anyFail = !amountOk || payerOk === false || termsState === "fail";
-  const verdict = anyFail ? VERDICT.FAILED : termsState === "unresolved" ? VERDICT.PARTIAL : VERDICT.VERIFIED;
+  const verdict = anyFail
+    ? VERDICT.FAILED
+    : termsState === "unresolved" || expired
+      ? VERDICT.PARTIAL
+      : VERDICT.VERIFIED;
   return { verdict, checks, extra: { tx: claims.tx_hash, resource: claims.resource, jti: claims.jti } };
 }

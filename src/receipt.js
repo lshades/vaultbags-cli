@@ -137,9 +137,15 @@ export function checkReceiptClaims(claims, { nowSec = Math.floor(Date.now() / 10
     expOk
       ? null
       : Number.isInteger(claims.exp)
-        ? `expired ${nowSec - claims.exp}s ago; a receipt is a time-boxed proof, the payment itself can still be read on-chain`
+        ? `expired ${nowSec - claims.exp}s ago; a receipt is a time-boxed proof, so it no longer stands on its own, and its signature and the payment it names are still checked`
         : "no expiry"
   );
+  // Past its expiry is not the same as malformed: the receipt was still issued
+  // and the payment still happened or did not. `expired` marks that one case,
+  // so a caller can keep checking the chain and settle on "partly verified"
+  // instead of reading a lapsed time box as a forgery. A receipt with no expiry
+  // at all is malformed and stays a failure.
+  if (!expOk && Number.isInteger(claims.exp)) out[out.length - 1].expired = true;
   const iatOk =
     Number.isInteger(claims.iat) &&
     claims.iat <= nowSec + IAT_TOLERANCE_SEC &&

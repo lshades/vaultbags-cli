@@ -177,6 +177,18 @@ test("expired, future-dated, and mis-addressed receipts fail their own rules", (
   assert.deepEqual(at({ event: "payment.failed" }), ["records a settled payment"]);
 });
 
+test("a lapsed time box is marked as such, a missing one is not", () => {
+  // `expired` lets verify receipt keep checking the chain and settle on partly
+  // verified; a receipt with no expiry at all is malformed and gets no marker.
+  const expiry = (over) =>
+    checkReceiptClaims(goodClaims(over), { nowSec: NOW }).find((c) => c.label === "not expired");
+  assert.equal(expiry({ exp: NOW - 1 }).expired, true);
+  assert.equal(expiry({ exp: NOW - 86400 * 30 }).expired, true);
+  assert.equal(expiry({ exp: undefined }).expired, undefined);
+  assert.equal(expiry({ exp: NOW + 60 }).expired, undefined);
+  assert.equal(expiry({ exp: NOW + 60 }).ok, true);
+});
+
 test("the facts the chain leg depends on must be well-formed", () => {
   const at = (over) => failing(checkReceiptClaims(goodClaims(over), { nowSec: NOW }));
   assert.deepEqual(at({ tx_hash: "short" }), ["names a transaction"]);
