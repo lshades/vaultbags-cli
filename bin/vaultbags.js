@@ -15,7 +15,7 @@ import { dirname, join } from "node:path";
 import { refuseSecretArgs, warnSecretEnv, strategyKeyCandidates, REFUSAL_ADVICE } from "../src/keyguard.js";
 import { verifyClaim, verifyAllocation, verifyStrategy, verifyReport, verifyReserves, verifyLatestDay, verifyPayouts,
   verifyLiquidity, verifyReceipt, latestClosedMonth, exitCodeFor, VERDICT } from "../src/verify.js";
-import { apiGet, apiPost, base, rpc, HttpError, DEFAULT_RPC, terminalSafe } from "../src/io.js";
+import { apiGet, apiPost, base, HttpError, DEFAULT_RPC, terminalSafe } from "../src/io.js";
 
 // Every value that came from the API or the chain passes through this before a
 // person reads it (see terminalSafe): the colors are this tool's own, applied
@@ -241,7 +241,7 @@ async function cmdGet(tool, params) {
 //
 // Each section renders exactly as its standalone command would, so the output
 // teaches the individual commands. The combined verdict is the WORST of the
-// four: one failed check fails the run, one unresolved read keeps it from
+// five: one failed check fails the run, one unresolved read keeps it from
 // claiming success. A summary that averaged instead would be a summary that
 // hid things.
 async function cmdVerifyAll(render) {
@@ -463,7 +463,7 @@ async function main() {
         return render(await verifyReserves(V));
       }
       if (sub === "liquidity") {
-        return render(await verifyLiquidity(V), "liquidity");
+        return render(await verifyLiquidity(V));
       }
       if (sub === "payouts") {
         if (arg && !/^\d{4}-\d{2}-\d{2}$/.test(arg)) return usageError("the date must look like 2026-07-27");
