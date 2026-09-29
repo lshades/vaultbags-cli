@@ -1,7 +1,8 @@
 // v2 leaf spec (generalized ledger): era by row shape, asset-order
 // independence, malformed/duplicate rejection, v1/v2 domain separation.
-// Mirrors the checks the app's own merkle sim runs, so the two copies of the
-// spec cannot drift apart without one suite going red.
+// Mirrors the checks the app's own merkle sim runs, and pins the same vectors
+// the app pins (tools/merkle-check.mjs, tools/receipt-check.mjs), so the two
+// copies of the spec cannot drift apart without one suite going red.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { canonicalAssets, canonicalLeaf, hashLeaf, buildRoot, strategyPayload, canonicalStringify, sha256 } from "../src/canonical.js";
@@ -48,10 +49,23 @@ test("v1 leaf stays byte-identical (no assets key = old path)", () => {
   );
 });
 
+const SV_M1 = "1".repeat(32);
+const SV_M2 = "2".repeat(32);
+const SV_BASE = { wallet: "W".repeat(32), tokenMint: "T".repeat(32) };
+const SV_V1 = { ...SV_BASE, gold: "100", spyx: "5.5", usdy: "0", tx: "TXA" + "a".repeat(29) };
+const SV_V2 = { ...SV_BASE, assets: [{ mint: SV_M2, amount: "5.5" }, { mint: SV_M1, amount: "100" }], tx: "TXB" + "b".repeat(29) };
+const SV_V3 = { ...SV_BASE, gold: "0.000001", spyx: "0", usdy: "12.345678", tx: "TXC" + "c".repeat(29) };
+
+test("shared vectors: the same hashes the app pins in tools/merkle-check.mjs", () => {
+  assert.equal(hashLeaf(SV_V1), "7d4a554c7c9820f25c27ce27bd0cd21801fd06eb9812e970d917ed9bb87ce109");
+  assert.equal(hashLeaf(SV_V2), "7c07e7fa9500374b4a0ff5cb982c167dc03e704b657427c8aebc19b4c86b8b04");
+  assert.equal(buildRoot([SV_V3, SV_V1, SV_V2]), "bc58e9450644f24c9e5d3c647eca2ba9aba1e07670d68289bd181954191025eb");
+});
+
 // Cross-implementation vector: this hash was produced by the app's own
 // receiptCore (strategyReceiptPayload + receiptHash) over this exact fixture,
-// so the two copies of the strategy-receipt spec cannot drift without this
-// test going red.
+// and the app pins the same hash in tools/receipt-check.mjs, so the two copies
+// of the strategy-receipt spec cannot drift without one suite going red.
 test("strategy payload hashes to the app's reference vector", () => {
   const d = {
     date: "2026-08-20",
