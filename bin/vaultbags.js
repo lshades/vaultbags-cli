@@ -9,7 +9,7 @@
 // It never signs and never accepts a private key. See src/keyguard.js for why
 // that refusal is active rather than merely absent.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { refuseSecretArgs, warnSecretEnv, strategyKeyCandidates, REFUSAL_ADVICE } from "../src/keyguard.js";
@@ -26,6 +26,21 @@ const pkg = JSON.parse(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8")
 );
 const V = { version: pkg.version };
+
+// A file the caller saved (a response body, a question), read locally and
+// never sent anywhere. Bounded: the largest paid export is a few megabytes.
+const MAX_SAVED_FILE_BYTES = 32 * 1024 * 1024;
+function readSavedFile(path) {
+  if (!path) return { ok: false, reason: "needs a file path, like --body=response.json" };
+  try {
+    const st = statSync(path);
+    if (!st.isFile()) return { ok: false, reason: "that path is not a file" };
+    if (st.size > MAX_SAVED_FILE_BYTES) return { ok: false, reason: `larger than any response the vault serves (${MAX_SAVED_FILE_BYTES} bytes)` };
+    return { ok: true, text: readFileSync(path, "utf8") };
+  } catch (e) {
+    return { ok: false, reason: e?.code === "ENOENT" ? "no such file" : "could not be read" };
+  }
+}
 
 // `vaultbags tools | head` closes the pipe while this is still writing, and the
 // default reaction to that is a crash report about a broken pipe, which looks
@@ -330,7 +345,9 @@ ${c.bold("Verify")} (recomputed here, anchor read from Solana)
   verify payouts [date]          a day's payouts actually landed, asked of the chain
   verify liquidity               the protocol's own liquidity was added and locked on-chain
   verify receipt <jwt>           a paid call's signed receipt, then the payment it names, on-chain
-  verify all                    the five ledger checks in one run, worst verdict wins
+    [--body=<file>]              and that the saved response body is what it delivered
+    [--question=<file>]          and that the question in the file is the one it answered
+  verify all                   the five ledger checks in one run, worst verdict wins
                                  (not liquidity: its verdict is partly-verified by design)
 
   --json                         any verify command, as machine-readable output
@@ -471,7 +488,17 @@ async function main() {
       }
       if (sub === "receipt") {
         if (!arg) return usageError("verify receipt needs the token from a paid call's X-X402-Receipt header");
-        return render(await verifyReceipt(arg, V));
+        if (argv.includes("--body") || argv.includes("--question")) {
+          return usageError("give the file with an equals sign: --body=response.json --question=question.txt");
+        }
+        const delivered = {};
+        for (const [flag, field] of [["body", "bodyText"], ["question", "questionText"]]) {
+          if (params[flag] === undefined) continue;
+          const read = readSavedFile(params[flag]);
+          if (!read.ok) return usageError(`--${flag}: ${read.reason}`);
+          delivered[field] = read.text;
+        }
+        return render(await verifyReceipt(arg, V, delivered));
       }
       if (sub === "all") {
         return cmdVerifyAll(render);

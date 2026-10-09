@@ -36,7 +36,7 @@ import {
   programInstructions,
   redact,
 } from "./io.js";
-import { decodeReceipt, verifyReceiptSignature, checkReceiptClaims } from "./receipt.js";
+import { decodeReceipt, verifyReceiptSignature, checkReceiptClaims, checkDelivery } from "./receipt.js";
 import { TREASURY, DAMM_V2_PROGRAM } from "./pinned.js";
 import { sameDayWindow, afterDayWindow, afterMonthWindow, landedInWindow } from "./anchorWindow.js";
 
@@ -994,7 +994,12 @@ export function latestClosedMonth(now = new Date()) {
 // naming some other wallet would be the issuer contradicting itself. When the
 // terms cannot be read (the paid lane is off, or VB_BASE points elsewhere) the
 // verdict is partial, and says which comparison it could not make.
-export async function verifyReceipt(jwt, opts) {
+//
+// `delivered` optionally carries the saved response body and the question as
+// sent, to check against what the receipt says the payment bought. Those
+// comparisons are local and can only fail or pass; the chain is still read
+// either way, so a mismatch is reported next to the state of the payment.
+export async function verifyReceipt(jwt, opts, delivered = {}) {
   const checks = [];
   const decoded = decodeReceipt(jwt);
   if (!decoded.ok) {
@@ -1045,19 +1050,30 @@ export async function verifyReceipt(jwt, opts) {
   }
   if (claimsFailed) return { verdict: VERDICT.FAILED, checks };
 
+  // What the payment bought, against the text the caller holds.
+  let deliveryFailed = false;
+  let deliveryUnresolved = false;
+  for (const c of checkDelivery(claims, delivered)) {
+    checks.push(check(c.label, c.state, c.detail));
+    if (c.state === "fail") deliveryFailed = true;
+    if (c.state === "unresolved") deliveryUnresolved = true;
+  }
+
   // The chain. Everything above came from the issuer; this does not.
   let tx;
   try {
     tx = await getTransaction(claims.tx_hash);
   } catch (e) {
     checks.push(check("the payment read from Solana", "unresolved", e.message));
-    return { verdict: VERDICT.UNRESOLVED, checks };
+    // A text that does not match the receipt is settled locally; an unread
+    // chain does not soften that.
+    return { verdict: deliveryFailed ? VERDICT.FAILED : VERDICT.UNRESOLVED, checks };
   }
   if (!tx) {
     checks.push(
       check("the payment read from Solana", "unresolved", "this RPC does not have that transaction; try another with VB_RPC")
     );
-    return { verdict: VERDICT.UNRESOLVED, checks };
+    return { verdict: deliveryFailed ? VERDICT.FAILED : VERDICT.UNRESOLVED, checks };
   }
   if (tx.failed) {
     checks.push(check("the payment it names succeeded on-chain", "fail", "it reverted; nothing was paid"));
@@ -1116,10 +1132,10 @@ export async function verifyReceipt(jwt, opts) {
   }
   checks.push(check("paid to the wallet the vault advertises for payment", termsState, termsDetail));
 
-  const anyFail = !amountOk || payerOk === false || termsState === "fail";
+  const anyFail = !amountOk || payerOk === false || termsState === "fail" || deliveryFailed;
   const verdict = anyFail
     ? VERDICT.FAILED
-    : termsState === "unresolved" || expired
+    : termsState === "unresolved" || expired || deliveryUnresolved
       ? VERDICT.PARTIAL
       : VERDICT.VERIFIED;
   return { verdict, checks, extra: { tx: claims.tx_hash, resource: claims.resource, jti: claims.jti } };

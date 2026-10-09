@@ -8,11 +8,13 @@
 // touched, which closes the two classic JWT holes: "alg":"none" (a token with
 // no signature at all) and HS256 with the public key used as the secret.
 //
-// Pure: node:crypto only, no IO, so every branch is testable offline. The
-// signature proves who ISSUED the receipt. What the receipt SAYS is checked
-// against the chain in verify.js; nothing here counts as proof of payment.
+// Pure: node:crypto and the canonical JSON only, no IO, so every branch is
+// testable offline. The signature proves who ISSUED the receipt. What the
+// receipt SAYS is checked against the chain in verify.js; nothing here counts
+// as proof of payment.
 
-import { createPublicKey, verify as cryptoVerify } from "node:crypto";
+import { createPublicKey, createHash, verify as cryptoVerify } from "node:crypto";
+import { canonicalStringify } from "./canonical.js";
 
 export const RECEIPT_ISSUER = "vaultbags.app";
 export const RECEIPT_AUDIENCE = "vaultbags:x402-receipt";
@@ -189,5 +191,118 @@ export function checkReceiptClaims(claims, { nowSec = Math.floor(Date.now() / 10
   const networkOk = typeof claims.network === "string" && claims.network.length > 0 && claims.network.length <= 64;
   add("names the network", networkOk, networkOk ? null : "network is missing");
 
+  return out;
+}
+
+// --- What the payment bought ---------------------------------------------------
+//
+// A receipt can also name what the call delivered (`delivery`): for an answer,
+// the sha256 of the question as the agent read it, of the answer exactly as
+// served, and the tools whose results it read; for an export, the sha256 of the
+// served JSON body, canonicalized. Signed with the payment, that lets whoever
+// holds the text show it is what the vault delivered for that payment.
+//
+// What this proves is narrow and stated that way: the issuer signed these
+// hashes. Whether the answer is RIGHT is a different question, and nothing
+// here speaks to it.
+
+const HEX64 = /^[0-9a-f]{64}$/;
+const TOOL_NAME = /^[a-z][a-z0-9_]{0,63}$/;
+const MAX_DELIVERY_TOOLS = 16;
+const sha256Utf8 = (s) => createHash("sha256").update(s, "utf8").digest("hex");
+
+function deliveryShapeOk(d) {
+  if (!isObject(d) || d.v !== 1) return false;
+  if (d.kind === "answer") {
+    return (
+      HEX64.test(d.question_sha256 || "") &&
+      HEX64.test(d.answer_sha256 || "") &&
+      Array.isArray(d.tools) &&
+      d.tools.length <= MAX_DELIVERY_TOOLS &&
+      d.tools.every((t) => typeof t === "string" && TOOL_NAME.test(t)) &&
+      new Set(d.tools).size === d.tools.length &&
+      (d.tools_truncated === undefined || d.tools_truncated === true)
+    );
+  }
+  if (d.kind === "export") return HEX64.test(d.content_sha256 || "");
+  return false;
+}
+
+// The answer text out of a saved response body: the vault's own shape
+// (`answer`) or the OpenAI-compatible one (`choices[0].message.content`).
+function answerFromBody(json) {
+  if (isObject(json) && typeof json.answer === "string") return json.answer;
+  const content = isObject(json) && Array.isArray(json.choices) ? json.choices[0]?.message?.content : undefined;
+  return typeof content === "string" ? content : null;
+}
+
+// bodyText: the saved response body, exactly as received. questionText: the
+// question as sent; surrounding whitespace is removed before hashing, as the
+// agent does before reading it. Either may be null (not given).
+export function checkDelivery(claims, { bodyText = null, questionText = null } = {}) {
+  const out = [];
+  const add = (label, state, detail) => out.push({ label, state, detail: detail || null });
+  const d = claims?.delivery;
+  const given = bodyText !== null || questionText !== null;
+
+  if (d === undefined) {
+    if (given) {
+      add(
+        "says what the payment bought",
+        "unresolved",
+        "this receipt names the payment only (issued before receipts named their delivery), so the text you hold cannot be matched to it"
+      );
+    }
+    return out;
+  }
+  if (!deliveryShapeOk(d)) {
+    add("says what the payment bought", "fail", "its delivery field is malformed");
+    return out;
+  }
+
+  let json;
+  if (bodyText !== null) {
+    try {
+      // A byte-order mark is something an editor or a shell adds when saving,
+      // never part of what was served.
+      json = JSON.parse(bodyText.replace(/^﻿/, ""));
+    } catch {
+      json = undefined;
+    }
+  }
+
+  if (d.kind === "answer") {
+    const read = d.tools.length
+      ? `an answer, after reading ${d.tools.length} tool${d.tools.length === 1 ? "" : "s"}${d.tools_truncated ? " (list cut at its limit)" : ""}: ${d.tools.join(", ")}`
+      : "an answer, without reading any tool";
+    add("says what the payment bought", "ok", read);
+    if (bodyText !== null) {
+      const answer = json === undefined ? null : answerFromBody(json);
+      if (answer === null) {
+        add("the answer you hold is the one it delivered", "fail", "the saved body is not a response with an answer in it");
+      } else {
+        const match = sha256Utf8(answer) === d.answer_sha256;
+        add("the answer you hold is the one it delivered", match ? "ok" : "fail", match ? null : "its sha256 differs from the one the receipt names");
+      }
+    }
+    if (questionText !== null) {
+      const match = sha256Utf8(questionText.trim()) === d.question_sha256;
+      add("the question you hold is the one it answered", match ? "ok" : "fail", match ? null : "its sha256 differs from the one the receipt names");
+    }
+    return out;
+  }
+
+  add("says what the payment bought", "ok", `an export, sha256 ${d.content_sha256}`);
+  if (bodyText !== null) {
+    if (json === undefined) {
+      add("the export you hold is the one it delivered", "fail", "the saved body is not JSON");
+    } else {
+      const match = sha256Utf8(canonicalStringify(json)) === d.content_sha256;
+      add("the export you hold is the one it delivered", match ? "ok" : "fail", match ? null : "its canonical sha256 differs from the one the receipt names");
+    }
+  }
+  if (questionText !== null) {
+    add("the question you hold is the one it answered", "unresolved", "this receipt is for an export, which has no question");
+  }
   return out;
 }

@@ -12,6 +12,7 @@ import {
   decodeReceipt,
   verifyReceiptSignature,
   checkReceiptClaims,
+  checkDelivery,
   RECEIPT_ISSUER,
   RECEIPT_AUDIENCE,
   MAX_RECEIPT_BYTES,
@@ -250,4 +251,84 @@ test("a receipt is not mistaken for a secret, and a bare key given as one still 
   const key = "5".repeat(88);
   const keyArgs = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(key) ? [key] : [];
   assert.equal(refuseSecretArgs(["verify", "receipt", key], { signatureArgs: keyArgs }).refuse, true);
+});
+
+// --- What the payment bought ---------------------------------------------------
+//
+// The vectors are the ones the app pins (tools/x402-receipt-check.mjs there),
+// recomputed independently, so the issuer and this verifier hash the same way.
+
+const QUESTION = "What did the vault buy today, and why?";
+const ANSWER = "Gold 38%, the S&P 500 31%, US Treasuries 31%. é \u{1F4C8}";
+const ANSWER_DELIVERY = {
+  v: 1,
+  kind: "answer",
+  question_sha256: "d68de484b586537e5ea59abc6c5f61ebf65f0b3b4421728f408f39fcb888218a",
+  answer_sha256: "c470451742b536cf00ce7656ec5fdc0b12ce81bdfaa93a5aef2d029a5c8d1bbc",
+  tools: ["get_todays_allocation", "get_market_signals"],
+};
+const EXPORT_DELIVERY = {
+  v: 1,
+  kind: "export",
+  content_sha256: "30b00872a92d459b6f4d90215ee55fe1205e7d90d5a57073fc6e42cb0542c306",
+};
+const EXPORT_BODY_TEXT = JSON.stringify({ b: [3, 2, 1], a: { y: 1.5, x: "ñ" }, at: "2026-10-09T00:00:00.000Z", n: 0.1 + 0.2 });
+const states = (checks) => checks.map((c) => c.state);
+
+test("a receipt with no delivery adds nothing, unless a text was given to match", () => {
+  assert.deepEqual(checkDelivery(goodClaims()), []);
+  const asked = checkDelivery(goodClaims(), { bodyText: "{}" });
+  assert.deepEqual(states(asked), ["unresolved"]);
+});
+
+test("an answer delivery names its tools, and matches the answer and question it was for", () => {
+  const claims = goodClaims({ delivery: ANSWER_DELIVERY });
+  const named = checkDelivery(claims);
+  assert.deepEqual(states(named), ["ok"]);
+  assert.match(named[0].detail, /2 tools: get_todays_allocation, get_market_signals/);
+
+  const body = JSON.stringify({ answer: ANSWER, lane: "x402" }, null, 2);
+  assert.deepEqual(states(checkDelivery(claims, { bodyText: body, questionText: `  ${QUESTION}\n` })), ["ok", "ok", "ok"]);
+  // The OpenAI-compatible facade puts the same text in choices[0].
+  const facade = JSON.stringify({ choices: [{ index: 0, message: { role: "assistant", content: ANSWER } }] });
+  assert.deepEqual(states(checkDelivery(claims, { bodyText: facade })), ["ok", "ok"]);
+  // Saved by an editor that adds a byte-order mark: still the same body.
+  assert.deepEqual(states(checkDelivery(claims, { bodyText: "﻿" + body })), ["ok", "ok"]);
+});
+
+test("an answer or question that differs by one character fails", () => {
+  const claims = goodClaims({ delivery: ANSWER_DELIVERY });
+  const edited = JSON.stringify({ answer: ANSWER.replace("38%", "39%") });
+  assert.deepEqual(states(checkDelivery(claims, { bodyText: edited })), ["ok", "fail"]);
+  assert.deepEqual(states(checkDelivery(claims, { questionText: QUESTION + "!" })), ["ok", "fail"]);
+  assert.deepEqual(states(checkDelivery(claims, { bodyText: "not json" })), ["ok", "fail"]);
+  assert.deepEqual(states(checkDelivery(claims, { bodyText: JSON.stringify({ lane: "x402" }) })), ["ok", "fail"]);
+});
+
+test("an export delivery matches the saved body whatever its key order or spacing", () => {
+  const claims = goodClaims({ delivery: EXPORT_DELIVERY });
+  assert.deepEqual(states(checkDelivery(claims, { bodyText: EXPORT_BODY_TEXT })), ["ok", "ok"]);
+  const reordered = JSON.stringify(JSON.parse(EXPORT_BODY_TEXT), ["n", "at", "b", "a", "y", "x"], 4);
+  assert.deepEqual(states(checkDelivery(claims, { bodyText: reordered })), ["ok", "ok"]);
+  const changed = EXPORT_BODY_TEXT.replace("[3,2,1]", "[1,2,3]");
+  assert.deepEqual(states(checkDelivery(claims, { bodyText: changed })), ["ok", "fail"]);
+  // An export has no question to match.
+  assert.deepEqual(states(checkDelivery(claims, { questionText: QUESTION })), ["ok", "unresolved"]);
+});
+
+test("a malformed delivery is a failure, never read as a match", () => {
+  const bad = [
+    { ...ANSWER_DELIVERY, v: 2 },
+    { ...ANSWER_DELIVERY, kind: "gift" },
+    { ...ANSWER_DELIVERY, answer_sha256: "00" },
+    { ...ANSWER_DELIVERY, tools: ["two words"] },
+    { ...ANSWER_DELIVERY, tools: ["get_meter", "get_meter"] },
+    { ...ANSWER_DELIVERY, tools: "\u001b[2Jget_meter" },
+    { ...EXPORT_DELIVERY, content_sha256: EXPORT_DELIVERY.content_sha256.toUpperCase() },
+    null,
+    "answer",
+  ];
+  for (const delivery of bad) {
+    assert.deepEqual(states(checkDelivery(goodClaims({ delivery }), { bodyText: EXPORT_BODY_TEXT })), ["fail"], JSON.stringify(delivery));
+  }
 });
