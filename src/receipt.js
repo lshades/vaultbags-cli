@@ -204,28 +204,75 @@ export function checkReceiptClaims(claims, { nowSec = Math.floor(Date.now() / 10
 //
 // What this proves is narrow and stated that way: the issuer signed these
 // hashes. Whether the answer is RIGHT is a different question, and nothing
-// here speaks to it.
+// here speaks to it. An answer checked without its question proves which
+// answer was delivered and nothing about what it answered, so that check is
+// reported as not settled rather than passed.
+//
+// The rules a reimplementation needs, in full:
+//   question_sha256  sha256 of the question's UTF-8 bytes after removing the
+//                    whitespace JavaScript's String.prototype.trim removes at
+//                    both ends (Unicode White_Space, line terminators and
+//                    U+FEFF). Through the OpenAI-compatible endpoint, the
+//                    question is the last message with role "user" (its text
+//                    parts joined with a line feed), trimmed the same way.
+//   answer_sha256    sha256 of the answer's UTF-8 bytes exactly as served.
+//   content_sha256   sha256 of the export body's canonical JSON: object keys
+//                    sorted by UTF-16 code unit, arrays in order, no
+//                    whitespace, strings and numbers written as JSON.stringify
+//                    writes them (numbers in their shortest round-trip form).
+//                    For any JSON a response can carry, that is the canonical
+//                    form RFC 8785 defines.
+// The question hash is not salted: anyone can hash a guess and compare, so a
+// receipt does not keep its question secret from someone who can guess it.
 
 const HEX64 = /^[0-9a-f]{64}$/;
-const TOOL_NAME = /^[a-z][a-z0-9_]{0,63}$/;
+// The tool names a receipt carries: the agent's analyst tools are camelCase
+// (getMarketOverview), its public surface snake_case (get_market_signals).
+const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 const MAX_DELIVERY_TOOLS = 16;
+const DELIVERY_VERSION = 1;
+const ANSWER_KEYS = new Set(["v", "kind", "question_sha256", "answer_sha256", "tools", "tools_incomplete"]);
+const EXPORT_KEYS = new Set(["v", "kind", "content_sha256"]);
 const sha256Utf8 = (s) => createHash("sha256").update(s, "utf8").digest("hex");
+// A byte-order mark is something an editor or a shell adds when saving, never
+// part of what was served.
+const withoutBom = (s) => (s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
 
-function deliveryShapeOk(d) {
-  if (!isObject(d) || d.v !== 1) return false;
+// "ok", "malformed", or "newer": a delivery written in a version or a kind
+// this verifier does not know, or carrying fields it does not read. Newer is
+// not a failure: the issuer signed something this version cannot check, and
+// the honest answer is "update and check again", never "forged".
+function deliveryShape(d) {
+  if (!isObject(d)) return "malformed";
+  if (Number.isInteger(d.v) && d.v > DELIVERY_VERSION) return "newer";
+  if (d.v !== DELIVERY_VERSION) return "malformed";
   if (d.kind === "answer") {
-    return (
+    const known =
       HEX64.test(d.question_sha256 || "") &&
       HEX64.test(d.answer_sha256 || "") &&
       Array.isArray(d.tools) &&
       d.tools.length <= MAX_DELIVERY_TOOLS &&
       d.tools.every((t) => typeof t === "string" && TOOL_NAME.test(t)) &&
       new Set(d.tools).size === d.tools.length &&
-      (d.tools_truncated === undefined || d.tools_truncated === true)
-    );
+      (d.tools_incomplete === undefined || d.tools_incomplete === true);
+    if (!known) return "malformed";
+    return Object.keys(d).every((k) => ANSWER_KEYS.has(k)) ? "ok" : "newer";
   }
-  if (d.kind === "export") return HEX64.test(d.content_sha256 || "");
-  return false;
+  if (d.kind === "export") {
+    if (!HEX64.test(d.content_sha256 || "")) return "malformed";
+    return Object.keys(d).every((k) => EXPORT_KEYS.has(k)) ? "ok" : "newer";
+  }
+  return typeof d.kind === "string" && /^[a-z][a-z0-9_-]{0,31}$/.test(d.kind) ? "newer" : "malformed";
+}
+
+// The question as the agent hashed it. A file saved on Windows may carry
+// carriage returns the question never had, so that spelling is tried too.
+function questionMatches(questionText, expected) {
+  const plain = withoutBom(questionText);
+  if (sha256Utf8(plain.trim()) === expected) return { match: true, note: null };
+  const lf = plain.replace(/\r\n/g, "\n");
+  if (lf !== plain && sha256Utf8(lf.trim()) === expected) return { match: true, note: "matched once the file's Windows line endings were read as line feeds" };
+  return { match: false, note: null };
 }
 
 // The answer text out of a saved response body: the vault's own shape
@@ -255,7 +302,18 @@ export function checkDelivery(claims, { bodyText = null, questionText = null } =
     }
     return out;
   }
-  if (!deliveryShapeOk(d)) {
+  const shape = deliveryShape(d);
+  if (shape === "newer") {
+    const v = Number.isInteger(d.v) ? `v${d.v}` : "an unknown version";
+    const kind = typeof d.kind === "string" ? `, kind ${JSON.stringify(d.kind)}` : "";
+    add(
+      "says what the payment bought",
+      "unresolved",
+      `it is written in a format newer than this verifier reads (${v}${kind}); update and check again: npx vaultbags-cli@latest verify receipt <jwt>`
+    );
+    return out;
+  }
+  if (shape === "malformed") {
     add("says what the payment bought", "fail", "its delivery field is malformed");
     return out;
   }
@@ -263,31 +321,45 @@ export function checkDelivery(claims, { bodyText = null, questionText = null } =
   let json;
   if (bodyText !== null) {
     try {
-      // A byte-order mark is something an editor or a shell adds when saving,
-      // never part of what was served.
-      json = JSON.parse(bodyText.replace(/^﻿/, ""));
+      json = JSON.parse(withoutBom(bodyText));
     } catch {
       json = undefined;
     }
   }
 
   if (d.kind === "answer") {
+    const incomplete = d.tools_incomplete ? " (the list is incomplete: at least one read could not be named)" : "";
     const read = d.tools.length
-      ? `an answer, after reading ${d.tools.length} tool${d.tools.length === 1 ? "" : "s"}${d.tools_truncated ? " (list cut at its limit)" : ""}: ${d.tools.join(", ")}`
-      : "an answer, without reading any tool";
+      ? `an answer, after reading ${d.tools.length} tool${d.tools.length === 1 ? "" : "s"}${incomplete}: ${d.tools.join(", ")}`
+      : d.tools_incomplete
+        ? "an answer, after reading tools this receipt could not name"
+        : "an answer, without reading any tool";
     add("says what the payment bought", "ok", read);
     if (bodyText !== null) {
       const answer = json === undefined ? null : answerFromBody(json);
       if (answer === null) {
-        add("the answer you hold is the one it delivered", "fail", "the saved body is not a response with an answer in it");
+        add(
+          "the answer you hold is the one it delivered",
+          "fail",
+          isObject(json) && !Array.isArray(json.choices) && json.answer === undefined
+            ? "the saved body has no answer in it (an export's body is checked against an export's receipt)"
+            : "the saved body is not a response with an answer in it"
+        );
       } else {
         const match = sha256Utf8(answer) === d.answer_sha256;
         add("the answer you hold is the one it delivered", match ? "ok" : "fail", match ? null : "its sha256 differs from the one the receipt names");
       }
+      if (questionText === null) {
+        add(
+          "the question it answered",
+          "unresolved",
+          "not checked: without the question as sent (--question=<file>) this shows which answer was delivered, not what it was the answer to"
+        );
+      }
     }
     if (questionText !== null) {
-      const match = sha256Utf8(questionText.trim()) === d.question_sha256;
-      add("the question you hold is the one it answered", match ? "ok" : "fail", match ? null : "its sha256 differs from the one the receipt names");
+      const q = questionMatches(questionText, d.question_sha256);
+      add("the question you hold is the one it answered", q.match ? "ok" : "fail", q.match ? q.note : "its sha256 differs from the one the receipt names");
     }
     return out;
   }

@@ -291,18 +291,49 @@ test("an answer delivery names its tools, and matches the answer and question it
   assert.deepEqual(states(checkDelivery(claims, { bodyText: body, questionText: `  ${QUESTION}\n` })), ["ok", "ok", "ok"]);
   // The OpenAI-compatible facade puts the same text in choices[0].
   const facade = JSON.stringify({ choices: [{ index: 0, message: { role: "assistant", content: ANSWER } }] });
-  assert.deepEqual(states(checkDelivery(claims, { bodyText: facade })), ["ok", "ok"]);
-  // Saved by an editor that adds a byte-order mark: still the same body.
-  assert.deepEqual(states(checkDelivery(claims, { bodyText: "﻿" + body })), ["ok", "ok"]);
+  assert.deepEqual(states(checkDelivery(claims, { bodyText: facade, questionText: QUESTION })), ["ok", "ok", "ok"]);
+  // Saved by an editor that adds a byte-order mark: still the same body, and
+  // the same question.
+  const BOM = String.fromCharCode(0xfeff);
+  assert.deepEqual(states(checkDelivery(claims, { bodyText: BOM + body, questionText: BOM + QUESTION })), ["ok", "ok", "ok"]);
+});
+
+test("an answer checked without its question is not settled", () => {
+  const claims = goodClaims({ delivery: ANSWER_DELIVERY });
+  const body = JSON.stringify({ answer: ANSWER });
+  const out = checkDelivery(claims, { bodyText: body });
+  assert.deepEqual(states(out), ["ok", "ok", "unresolved"]);
+  assert.match(out[2].detail, /--question=<file>/);
+});
+
+test("a question saved with Windows line endings still matches, and says so", () => {
+  const multi = "What did the vault buy today?\nAnd why?";
+  const delivery = { ...ANSWER_DELIVERY, question_sha256: createHash("sha256").update(multi, "utf8").digest("hex") };
+  const out = checkDelivery(goodClaims({ delivery }), { questionText: multi.replace(/\n/g, "\r\n") + "\r\n" });
+  assert.deepEqual(states(out), ["ok", "ok"]);
+  assert.match(out[1].detail, /line endings/);
+  assert.deepEqual(states(checkDelivery(goodClaims({ delivery }), { questionText: "What did the vault buy today? And why?" })), ["ok", "fail"]);
+});
+
+test("the analyst's camelCase tools are named, and an incomplete list says so", () => {
+  const delivery = { ...ANSWER_DELIVERY, tools: ["getMarketOverview", "get_market_signals"], tools_incomplete: true };
+  const out = checkDelivery(goodClaims({ delivery }));
+  assert.deepEqual(states(out), ["ok"]);
+  assert.match(out[0].detail, /getMarketOverview, get_market_signals/);
+  assert.match(out[0].detail, /incomplete/);
+  const none = checkDelivery(goodClaims({ delivery: { ...ANSWER_DELIVERY, tools: [], tools_incomplete: true } }));
+  assert.match(none[0].detail, /could not name/);
 });
 
 test("an answer or question that differs by one character fails", () => {
   const claims = goodClaims({ delivery: ANSWER_DELIVERY });
   const edited = JSON.stringify({ answer: ANSWER.replace("38%", "39%") });
-  assert.deepEqual(states(checkDelivery(claims, { bodyText: edited })), ["ok", "fail"]);
+  assert.deepEqual(states(checkDelivery(claims, { bodyText: edited, questionText: QUESTION })), ["ok", "fail", "ok"]);
   assert.deepEqual(states(checkDelivery(claims, { questionText: QUESTION + "!" })), ["ok", "fail"]);
-  assert.deepEqual(states(checkDelivery(claims, { bodyText: "not json" })), ["ok", "fail"]);
-  assert.deepEqual(states(checkDelivery(claims, { bodyText: JSON.stringify({ lane: "x402" }) })), ["ok", "fail"]);
+  assert.deepEqual(states(checkDelivery(claims, { bodyText: "not json", questionText: QUESTION })), ["ok", "fail", "ok"]);
+  const exportBody = checkDelivery(claims, { bodyText: JSON.stringify({ lane: "x402" }), questionText: QUESTION });
+  assert.deepEqual(states(exportBody), ["ok", "fail", "ok"]);
+  assert.match(exportBody[1].detail, /no answer in it/);
 });
 
 test("an export delivery matches the saved body whatever its key order or spacing", () => {
@@ -316,10 +347,32 @@ test("an export delivery matches the saved body whatever its key order or spacin
   assert.deepEqual(states(checkDelivery(claims, { questionText: QUESTION })), ["ok", "unresolved"]);
 });
 
+test("a delivery in a newer format is unresolved, with the way to check it, never a failure", () => {
+  const newer = [
+    { ...ANSWER_DELIVERY, v: 2 },
+    { v: 7, kind: "image", digest: "x" },
+    { ...ANSWER_DELIVERY, kind: "gift" },
+    { ...ANSWER_DELIVERY, question_normalization: "nfc" },
+    { ...EXPORT_DELIVERY, content_encoding: "gzip" },
+  ];
+  for (const delivery of newer) {
+    const out = checkDelivery(goodClaims({ delivery }), { bodyText: EXPORT_BODY_TEXT });
+    assert.deepEqual(states(out), ["unresolved"], JSON.stringify(delivery));
+    assert.match(out[0].detail, /npx vaultbags-cli@latest/);
+  }
+  // With nothing given to match, a newer format still says it was not read.
+  assert.deepEqual(states(checkDelivery(goodClaims({ delivery: { ...ANSWER_DELIVERY, v: 2 } }))), ["unresolved"]);
+});
+
 test("a malformed delivery is a failure, never read as a match", () => {
   const bad = [
-    { ...ANSWER_DELIVERY, v: 2 },
-    { ...ANSWER_DELIVERY, kind: "gift" },
+    { ...ANSWER_DELIVERY, v: 0 },
+    { ...ANSWER_DELIVERY, v: "2" },
+    { ...ANSWER_DELIVERY, v: 1.5 },
+    { ...ANSWER_DELIVERY, kind: "Gift!" },
+    { ...ANSWER_DELIVERY, kind: 7 },
+    { ...ANSWER_DELIVERY, tools_incomplete: false },
+    { ...ANSWER_DELIVERY, tools: ["9tool"] },
     { ...ANSWER_DELIVERY, answer_sha256: "00" },
     { ...ANSWER_DELIVERY, tools: ["two words"] },
     { ...ANSWER_DELIVERY, tools: ["get_meter", "get_meter"] },

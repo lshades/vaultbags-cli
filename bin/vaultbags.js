@@ -12,7 +12,8 @@
 import { readFileSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { refuseSecretArgs, warnSecretEnv, strategyKeyCandidates, REFUSAL_ADVICE } from "../src/keyguard.js";
+import { refuseSecretArgs, warnSecretEnv, strategyKeyCandidates, looksLikeSecretFile, REFUSAL_ADVICE } from "../src/keyguard.js";
+import { decodeSavedFile } from "../src/savedFile.js";
 import { verifyClaim, verifyAllocation, verifyStrategy, verifyReport, verifyReserves, verifyLatestDay, verifyPayouts,
   verifyLiquidity, verifyReceipt, latestClosedMonth, exitCodeFor, VERDICT } from "../src/verify.js";
 import { apiGet, apiPost, base, HttpError, DEFAULT_RPC, terminalSafe } from "../src/io.js";
@@ -29,17 +30,26 @@ const V = { version: pkg.version };
 
 // A file the caller saved (a response body, a question), read locally and
 // never sent anywhere. Bounded: the largest paid export is a few megabytes.
+// Decoded by src/savedFile.js (UTF-8, or the UTF-16 PowerShell writes), and a
+// file that is a key or a seed phrase is refused like one typed as an argument.
 const MAX_SAVED_FILE_BYTES = 32 * 1024 * 1024;
 function readSavedFile(path) {
   if (!path) return { ok: false, reason: "needs a file path, like --body=response.json" };
+  let bytes;
   try {
     const st = statSync(path);
     if (!st.isFile()) return { ok: false, reason: "that path is not a file" };
     if (st.size > MAX_SAVED_FILE_BYTES) return { ok: false, reason: `larger than any response the vault serves (${MAX_SAVED_FILE_BYTES} bytes)` };
-    return { ok: true, text: readFileSync(path, "utf8") };
+    bytes = readFileSync(path);
   } catch (e) {
     return { ok: false, reason: e?.code === "ENOENT" ? "no such file" : "could not be read" };
   }
+  const decoded = decodeSavedFile(bytes);
+  if (!decoded.ok) return decoded;
+  if (looksLikeSecretFile(decoded.text)) {
+    return { ok: false, secret: true, reason: "that file looks like a private key or a seed phrase. This tool never accepts one, and never signs anything." };
+  }
+  return decoded;
 }
 
 // `vaultbags tools | head` closes the pipe while this is still writing, and the
@@ -345,9 +355,10 @@ ${c.bold("Verify")} (recomputed here, anchor read from Solana)
   verify payouts [date]          a day's payouts actually landed, asked of the chain
   verify liquidity               the protocol's own liquidity was added and locked on-chain
   verify receipt <jwt>           a paid call's signed receipt, then the payment it names, on-chain
-    [--body=<file>]              and that the saved response body is what it delivered
+    [--body=<file>]              and that the saved response is what it delivered
     [--question=<file>]          and that the question in the file is the one it answered
-  verify all                   the five ledger checks in one run, worst verdict wins
+                                 (an answer checked without its question is partly verified)
+  verify all                     the five ledger checks in one run, worst verdict wins
                                  (not liquidity: its verdict is partly-verified by design)
 
   --json                         any verify command, as machine-readable output
@@ -458,6 +469,14 @@ async function main() {
 
   switch (cmd) {
     case "verify": {
+      // An option this command does not know is refused, never ignored: a
+      // mistyped --body would otherwise leave the body unchecked and the
+      // verdict silent about it. Only the option's name is echoed back.
+      for (const a of argv) {
+        if (!a.startsWith("-") || a === "--json" || a.startsWith("--json=")) continue;
+        if (sub === "receipt" && /^--(body|question)(=|$)/.test(a)) continue;
+        return usageError(`verify ${t(sub || "")}: unknown option ${t(a.split("=")[0])}`);
+      }
       const render = params.json !== undefined || argv.includes("--json") ? printJson : printChecks;
       if (sub === "claim") {
         if (!arg) return usageError("verify claim needs a transaction signature");
@@ -495,6 +514,11 @@ async function main() {
         for (const [flag, field] of [["body", "bodyText"], ["question", "questionText"]]) {
           if (params[flag] === undefined) continue;
           const read = readSavedFile(params[flag]);
+          if (read.secret) {
+            console.error(c.red(c.bold("Refused.")) + ` --${flag}: ` + read.reason);
+            for (const line of REFUSAL_ADVICE) console.error(c.dim("  " + line));
+            return 2;
+          }
           if (!read.ok) return usageError(`--${flag}: ${read.reason}`);
           delivered[field] = read.text;
         }

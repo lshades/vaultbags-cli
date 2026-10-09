@@ -84,6 +84,20 @@ export function looksLikeSecret(value) {
   return false;
 }
 
+// A file handed to the verifier (a saved response, a question) is hashed here
+// and never sent anywhere, and a key file is refused all the same: the habit
+// this guard exists for does not depend on where the bytes go. Whole-content
+// shapes only (a keypair file, a key or a seed phrase saved on its own), and
+// only in a file small enough to be one: a response or a question that
+// mentions a few list words is ordinary text.
+const MAX_SECRET_FILE_CHARS = 4096;
+export function looksLikeSecretFile(text) {
+  if (typeof text !== "string") return false;
+  const v = text.trim();
+  if (!v || v.length > MAX_SECRET_FILE_CHARS) return false;
+  return looksLikeMnemonic(v) || BYTE_ARRAY.test(v) || BASE58_SECRET.test(v) || HEX_SECRET.test(v);
+}
+
 // Flags whose NAME alone says a secret is being offered, whatever the value is.
 const SECRET_FLAG = /^--?(private[-_]?key|secret[-_]?key|keypair|mnemonic|seed([-_]?phrase)?|wallet[-_]?key)(=|$)/i;
 
