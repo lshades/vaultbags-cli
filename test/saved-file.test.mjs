@@ -67,6 +67,32 @@ test("an option verify does not know is refused, not ignored", () => {
   }
 });
 
+test("an argument verify does not read is refused, not ignored, and never echoed", () => {
+  const stray = "response-saved-yesterday.json";
+  for (const args of [
+    ["verify", "receipt", JWT, stray],
+    ["verify", "receipt", JWT, JWT],
+    ["verify", "claim", "x", stray],
+    ["verify", "reserves", stray],
+    ["verify", "liquidity", stray],
+    ["verify", "all", stray],
+    ["verify", "allocation", "2026-10-09", stray],
+    ["verify", "payouts", "2026-10-09", stray],
+    ["verify", "report", "2026-09-01", stray],
+    ["verify", "strategy", "classic", "2026-10-09", stray],
+  ]) {
+    const r = run(...args);
+    assert.equal(r.status, 2, args.join(" "));
+    assert.match(r.stderr, /more (was|were) given and would have been ignored/, args.join(" "));
+    assert.ok(!r.stderr.includes(stray), "what was typed is not echoed back");
+  }
+  // The arguments each command does read are still read (these fail later,
+  // for their own reasons, never as "too many").
+  for (const args of [["verify", "strategy", "classic", "2026-10-09"], ["verify", "receipt", JWT, "--json"]]) {
+    assert.doesNotMatch(run(...args).stderr, /would have been ignored/, args.join(" "));
+  }
+});
+
 test("a key saved to a file and passed as the body or the question is refused", () => {
   const dir = mkdtempSync(join(tmpdir(), "vb-saved-"));
   try {

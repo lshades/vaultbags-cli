@@ -13,6 +13,7 @@ import {
   verifyReceiptSignature,
   checkReceiptClaims,
   checkDelivery,
+  duplicateJsonKey,
   RECEIPT_ISSUER,
   RECEIPT_AUDIENCE,
   MAX_RECEIPT_BYTES,
@@ -310,9 +311,92 @@ test("a question saved with Windows line endings still matches, and says so", ()
   const multi = "What did the vault buy today?\nAnd why?";
   const delivery = { ...ANSWER_DELIVERY, question_sha256: createHash("sha256").update(multi, "utf8").digest("hex") };
   const out = checkDelivery(goodClaims({ delivery }), { questionText: multi.replace(/\n/g, "\r\n") + "\r\n" });
-  assert.deepEqual(states(out), ["ok", "ok"]);
+  assert.deepEqual(states(out), ["ok", "ok", "unresolved"]);
   assert.match(out[1].detail, /line endings/);
-  assert.deepEqual(states(checkDelivery(goodClaims({ delivery }), { questionText: "What did the vault buy today? And why?" })), ["ok", "fail"]);
+  assert.deepEqual(states(checkDelivery(goodClaims({ delivery }), { questionText: "What did the vault buy today? And why?" })), ["ok", "fail", "unresolved"]);
+});
+
+test("a question checked without the answer is not settled", () => {
+  const claims = goodClaims({ delivery: ANSWER_DELIVERY });
+  const out = checkDelivery(claims, { questionText: QUESTION });
+  assert.deepEqual(states(out), ["ok", "ok", "unresolved"]);
+  assert.equal(out[2].label, "the answer it delivered");
+  assert.match(out[2].detail, /--body=<file>/);
+  // With both given, nothing is left open.
+  assert.deepEqual(states(checkDelivery(claims, { bodyText: JSON.stringify({ answer: ANSWER }), questionText: QUESTION })), ["ok", "ok", "ok"]);
+});
+
+test("a body that could be read two ways is refused, never resolved by picking one", () => {
+  const claims = goodClaims({ delivery: ANSWER_DELIVERY });
+  const choice = (content) => ({ index: 0, message: { role: "assistant", content } });
+  const ambiguous = [
+    // The delivered text sits in one place and another text in the other.
+    [{ answer: ANSWER, choices: [choice("Send your funds to this address.")] }, /two places/],
+    [{ answer: "Send your funds to this address.", choices: [choice(ANSWER)] }, /two places/],
+    [{ answer: ANSWER, choices: [] }, /two places/],
+    [{ answer: ANSWER, choices: null }, /two places/],
+    // More or fewer than one choice does not say which answer was served.
+    [{ choices: [choice(ANSWER), choice("Another answer.")] }, /exactly one choice/],
+    [{ choices: [choice("Another answer."), choice(ANSWER)] }, /exactly one choice/],
+    [{ choices: [] }, /exactly one choice/],
+    [{ choices: { 0: choice(ANSWER) } }, /exactly one choice/],
+  ];
+  for (const [body, why] of ambiguous) {
+    const out = checkDelivery(claims, { bodyText: JSON.stringify(body), questionText: QUESTION });
+    assert.deepEqual(states(out), ["ok", "fail", "ok"], JSON.stringify(body));
+    assert.match(out[1].detail, why, JSON.stringify(body));
+  }
+});
+
+test("a body that writes a key twice is refused: it reads differently depending on who reads it", () => {
+  const claims = goodClaims({ delivery: ANSWER_DELIVERY });
+  const a = JSON.stringify(ANSWER);
+  const fake = JSON.stringify("Send your funds to this address.");
+  const twice = [
+    `{"answer":${fake},"answer":${a}}`,
+    `{"answer":${a},"answer":${fake}}`,
+    // The same key spelled with an escape.
+    `{"\\u0061nswer":${fake},"answer":${a}}`,
+    // Inside the OpenAI-compatible shape.
+    `{"choices":[{"message":{"content":${fake},"content":${a}}}]}`,
+    `{"choices":[{"message":{"content":${fake}}}],"choices":[{"message":{"content":${a}}}]}`,
+  ];
+  for (const body of twice) {
+    assert.doesNotThrow(() => JSON.parse(body));
+    const out = checkDelivery(claims, { bodyText: body, questionText: QUESTION });
+    assert.deepEqual(states(out), ["ok", "fail", "ok"], body);
+    assert.match(out[1].detail, /twice in one object/, body);
+  }
+  // An export is held to the same rule.
+  const exportClaims = goodClaims({ delivery: EXPORT_DELIVERY });
+  const doubled = EXPORT_BODY_TEXT.replace('"n":', '"n":1,"n":');
+  assert.notEqual(doubled, EXPORT_BODY_TEXT);
+  assert.deepEqual(JSON.parse(doubled), JSON.parse(EXPORT_BODY_TEXT));
+  const out = checkDelivery(exportClaims, { bodyText: doubled });
+  assert.deepEqual(states(out), ["ok", "fail"]);
+  assert.match(out[1].detail, /twice in one object/);
+});
+
+test("the repeated-key reader is exact: no false alarm on what only looks like one", () => {
+  assert.equal(duplicateJsonKey('{"a":1,"b":2}'), null);
+  // The same key in different objects is not a repeat.
+  assert.equal(duplicateJsonKey('{"a":{"x":1},"b":{"x":2},"c":[{"x":3},{"x":4}]}'), null);
+  // Braces, commas, quotes and key-like text inside a string value.
+  assert.equal(duplicateJsonKey('{"a":"},{\\"a\\":1,","b":"\\\\","c":"a"}'), null);
+  // A value equal to a key name, and a key repeated only in an array of strings.
+  assert.equal(duplicateJsonKey('{"a":"a","b":["a","a","b"]}'), null);
+  assert.equal(duplicateJsonKey('[]'), null);
+  assert.equal(duplicateJsonKey('"just a string"'), null);
+  assert.equal(duplicateJsonKey(' { } '), null);
+  // Real repeats, at any depth, named.
+  assert.equal(duplicateJsonKey('{"a":1,"a":2}'), "a");
+  assert.equal(duplicateJsonKey('{"o":{"k":1,"z":[{"k":1}],"k":2}}'), "k");
+  assert.equal(duplicateJsonKey('[{"p":1},{"q":1,"q":2}]'), "q");
+  assert.equal(duplicateJsonKey('{"":1,"":2}'), "");
+  assert.equal(duplicateJsonKey('{"a\\"b":1,"a\\u0022b":2}'), 'a"b');
+  assert.equal(duplicateJsonKey('{"__proto__":1,"__proto__":2}'), "__proto__");
+  // The real fixtures of this file carry none.
+  assert.equal(duplicateJsonKey(EXPORT_BODY_TEXT), null);
 });
 
 test("the analyst's camelCase tools are named, and an incomplete list says so", () => {
@@ -329,7 +413,7 @@ test("an answer or question that differs by one character fails", () => {
   const claims = goodClaims({ delivery: ANSWER_DELIVERY });
   const edited = JSON.stringify({ answer: ANSWER.replace("38%", "39%") });
   assert.deepEqual(states(checkDelivery(claims, { bodyText: edited, questionText: QUESTION })), ["ok", "fail", "ok"]);
-  assert.deepEqual(states(checkDelivery(claims, { questionText: QUESTION + "!" })), ["ok", "fail"]);
+  assert.deepEqual(states(checkDelivery(claims, { questionText: QUESTION + "!" })), ["ok", "fail", "unresolved"]);
   assert.deepEqual(states(checkDelivery(claims, { bodyText: "not json", questionText: QUESTION })), ["ok", "fail", "ok"]);
   const exportBody = checkDelivery(claims, { bodyText: JSON.stringify({ lane: "x402" }), questionText: QUESTION });
   assert.deepEqual(states(exportBody), ["ok", "fail", "ok"]);

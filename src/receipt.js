@@ -224,6 +224,11 @@ export function checkReceiptClaims(claims, { nowSec = Math.floor(Date.now() / 10
 //                    form RFC 8785 defines.
 // The question hash is not salted: anyone can hash a guess and compare, so a
 // receipt does not keep its question secret from someone who can guess it.
+//
+// A saved body is only spoken for when it reads one way: no object in it
+// writes the same key twice, and an answer sits in exactly one place (the
+// vault's `answer`, or the single entry of `choices`). Anything else fails
+// the check instead of being resolved by picking a reading.
 
 const HEX64 = /^[0-9a-f]{64}$/;
 // The tool names a receipt carries: the agent's analyst tools are camelCase
@@ -275,12 +280,77 @@ function questionMatches(questionText, expected) {
   return { match: false, note: null };
 }
 
+// The first object key written twice in the same object, or null. `text` has
+// already parsed as JSON, so this only walks it. A key counts by what it
+// decodes to ("a" and "a" are the same key).
+//
+// Why it matters: JSON.parse keeps the LAST of two equal keys and other
+// readers keep the first, so a body carrying {"answer": X, "answer": Y} would
+// be checked here as Y while something else shows its reader X. A body like
+// that is not a response this tool can speak for, whichever one matches.
+export function duplicateJsonKey(text) {
+  const open = []; // one entry per open container: a Set of keys for an object, null for an array
+  let expectKey = false;
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    if (c === '"') {
+      let j = i + 1;
+      while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
+      if (expectKey) {
+        const key = JSON.parse(text.slice(i, j + 1));
+        const keys = open[open.length - 1];
+        if (keys.has(key)) return key;
+        keys.add(key);
+        expectKey = false;
+      }
+      i = j + 1;
+      continue;
+    }
+    if (c === "{") {
+      open.push(new Set());
+      expectKey = true;
+    } else if (c === "[") {
+      open.push(null);
+      expectKey = false;
+    } else if (c === "}" || c === "]") {
+      open.pop();
+      expectKey = false;
+    } else if (c === ",") {
+      expectKey = open[open.length - 1] instanceof Set;
+    }
+    i++;
+  }
+  return null;
+}
+
 // The answer text out of a saved response body: the vault's own shape
 // (`answer`) or the OpenAI-compatible one (`choices[0].message.content`).
+// Returns { answer } or { problem }. A body that could be read two ways is
+// refused, never resolved by picking one: both shapes at once, or a list of
+// choices that is not exactly one, would let the text this tool checks differ
+// from the text another reader shows.
 function answerFromBody(json) {
-  if (isObject(json) && typeof json.answer === "string") return json.answer;
-  const content = isObject(json) && Array.isArray(json.choices) ? json.choices[0]?.message?.content : undefined;
-  return typeof content === "string" ? content : null;
+  if (!isObject(json)) return { problem: "the saved body is not a response with an answer in it" };
+  const own = typeof json.answer === "string";
+  const hasChoices = json.choices !== undefined;
+  if (own && hasChoices) {
+    return { problem: "the saved body carries an answer in two places (answer and choices), so it does not say which one was served" };
+  }
+  if (own) return { answer: json.answer };
+  if (!hasChoices) {
+    return {
+      problem:
+        json.answer === undefined
+          ? "the saved body has no answer in it (an export's body is checked against an export's receipt)"
+          : "the saved body is not a response with an answer in it",
+    };
+  }
+  if (!Array.isArray(json.choices) || json.choices.length !== 1) {
+    return { problem: "the saved body does not carry exactly one choice, so it does not say which answer was served" };
+  }
+  const content = json.choices[0]?.message?.content;
+  return typeof content === "string" ? { answer: content } : { problem: "the saved body is not a response with an answer in it" };
 }
 
 // bodyText: the saved response body, exactly as received. questionText: the
@@ -319,13 +389,22 @@ export function checkDelivery(claims, { bodyText = null, questionText = null } =
   }
 
   let json;
+  // A key written twice in one object: the body reads differently depending
+  // on who reads it, so nothing is concluded from it.
+  let repeatedKey = null;
   if (bodyText !== null) {
+    const body = withoutBom(bodyText);
     try {
-      json = JSON.parse(withoutBom(bodyText));
+      json = JSON.parse(body);
+      repeatedKey = duplicateJsonKey(body);
     } catch {
       json = undefined;
     }
   }
+  const repeated =
+    repeatedKey === null
+      ? null
+      : `the saved body writes the key ${JSON.stringify(repeatedKey.slice(0, 40))} twice in one object, so it reads differently depending on who reads it`;
 
   if (d.kind === "answer") {
     const incomplete = d.tools_incomplete ? " (the list is incomplete: at least one read could not be named)" : "";
@@ -336,17 +415,11 @@ export function checkDelivery(claims, { bodyText = null, questionText = null } =
         : "an answer, without reading any tool";
     add("says what the payment bought", "ok", read);
     if (bodyText !== null) {
-      const answer = json === undefined ? null : answerFromBody(json);
-      if (answer === null) {
-        add(
-          "the answer you hold is the one it delivered",
-          "fail",
-          isObject(json) && !Array.isArray(json.choices) && json.answer === undefined
-            ? "the saved body has no answer in it (an export's body is checked against an export's receipt)"
-            : "the saved body is not a response with an answer in it"
-        );
+      const read = json === undefined ? { problem: "the saved body is not a response with an answer in it" } : repeated ? { problem: repeated } : answerFromBody(json);
+      if (read.problem) {
+        add("the answer you hold is the one it delivered", "fail", read.problem);
       } else {
-        const match = sha256Utf8(answer) === d.answer_sha256;
+        const match = sha256Utf8(read.answer) === d.answer_sha256;
         add("the answer you hold is the one it delivered", match ? "ok" : "fail", match ? null : "its sha256 differs from the one the receipt names");
       }
       if (questionText === null) {
@@ -360,6 +433,13 @@ export function checkDelivery(claims, { bodyText = null, questionText = null } =
     if (questionText !== null) {
       const q = questionMatches(questionText, d.question_sha256);
       add("the question you hold is the one it answered", q.match ? "ok" : "fail", q.match ? q.note : "its sha256 differs from the one the receipt names");
+      if (bodyText === null) {
+        add(
+          "the answer it delivered",
+          "unresolved",
+          "not checked: without the saved response (--body=<file>) this shows which question was answered, not what the answer was"
+        );
+      }
     }
     return out;
   }
@@ -368,6 +448,8 @@ export function checkDelivery(claims, { bodyText = null, questionText = null } =
   if (bodyText !== null) {
     if (json === undefined) {
       add("the export you hold is the one it delivered", "fail", "the saved body is not JSON");
+    } else if (repeated) {
+      add("the export you hold is the one it delivered", "fail", repeated);
     } else {
       const match = sha256Utf8(canonicalStringify(json)) === d.content_sha256;
       add("the export you hold is the one it delivered", match ? "ok" : "fail", match ? null : "its canonical sha256 differs from the one the receipt names");

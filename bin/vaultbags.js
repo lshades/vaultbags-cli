@@ -387,6 +387,19 @@ ${c.bold("Environment")}
   This tool never signs and never accepts a private key.`);
 }
 
+// How many arguments each verify command reads after its name.
+const VERIFY_ARGUMENTS = {
+  claim: 1,
+  allocation: 1,
+  strategy: 2,
+  reserves: 0,
+  liquidity: 0,
+  payouts: 1,
+  receipt: 1,
+  all: 0,
+  report: 1,
+};
+
 async function main() {
   const argv = process.argv.slice(2);
 
@@ -476,6 +489,16 @@ async function main() {
         if (!a.startsWith("-") || a === "--json" || a.startsWith("--json=")) continue;
         if (sub === "receipt" && /^--(body|question)(=|$)/.test(a)) continue;
         return usageError(`verify ${t(sub || "")}: unknown option ${t(a.split("=")[0])}`);
+      }
+      // Nor is an argument it does not read: a second token, or a file name
+      // typed without its option, would otherwise be dropped and the verdict
+      // silent about it. Only how many is said, never what they were.
+      const reads = VERIFY_ARGUMENTS[sub];
+      if (reads !== undefined && words.length - 2 > reads) {
+        const extra = words.length - 2 - reads;
+        return usageError(
+          `verify ${sub} reads ${reads === 0 ? "no argument" : reads === 1 ? "one argument" : `${reads} arguments`}; ${extra} more ${extra === 1 ? "was" : "were"} given and would have been ignored`
+        );
       }
       const render = params.json !== undefined || argv.includes("--json") ? printJson : printChecks;
       if (sub === "claim") {
