@@ -17,6 +17,9 @@ import { decodeSavedFile } from "../src/savedFile.js";
 import { verifyClaim, verifyAllocation, verifyStrategy, verifyReport, verifyReserves, verifyLatestDay, verifyPayouts,
   verifyLiquidity, verifyReceipt, latestClosedMonth, exitCodeFor, VERDICT } from "../src/verify.js";
 import { apiGet, apiPost, base, HttpError, DEFAULT_RPC, terminalSafe } from "../src/io.js";
+import { spawn } from "node:child_process";
+import { isWalletAddress, cacheKey, statusLineText, dueParts, refreshCache } from "../src/statusline.js";
+import { readCache, writeCache, isLocked, tryLock, releaseLock } from "../src/statuslineCache.js";
 
 // Every value that came from the API or the chain passes through this before a
 // person reads it (see terminalSafe): the colors are this tool's own, applied
@@ -217,6 +220,33 @@ async function cmdAsk(question) {
   return 0;
 }
 
+// --- status line -----------------------------------------------------------
+// One line from the local cache, at once (src/statusline.js). When the cache is
+// old, a detached copy of this command refreshes it in the background and the
+// next run shows the new figures: Claude Code cancels a status line that is
+// still running when the next update arrives, so this one never waits.
+
+async function cmdStatusline(wallet, refresh) {
+  const key = cacheKey(base(), wallet);
+  const cache = readCache(key);
+  if (refresh) {
+    if (!tryLock(key)) return 0;
+    try {
+      writeCache(key, await refreshCache(cache, { wallet, nowMs: Date.now(), get: (path) => apiGet(path, V) }));
+    } finally {
+      releaseLock(key);
+    }
+    return 0;
+  }
+  console.log(statusLineText(cache, { wallet, nowMs: Date.now() }));
+  const due = dueParts(cache, { wallet, nowMs: Date.now() });
+  if ((due.vault || due.wallet) && !isLocked(key)) {
+    const args = [fileURLToPath(import.meta.url), "statusline", "--refresh", ...(wallet ? [`--wallet=${wallet}`] : [])];
+    spawn(process.execPath, args, { detached: true, stdio: "ignore", windowsHide: true }).unref();
+  }
+  return 0;
+}
+
 // --- discovery -------------------------------------------------------------
 
 // An operation the spec says can answer 402 is a paid resource. The spec is
@@ -373,6 +403,14 @@ ${c.bold("Read")}
   reserves                       the wallets holding them
   brain-vs-flat                  the daily line vs an even split, win or lose
   ask "<question>"               the agent's free lane
+
+${c.bold("Status line")}
+  statusline [--wallet=<address>]
+                                 one line: what the wallet has to claim in real units,
+                                 the vault, today's buy, the agent's next run. For
+                                 Claude Code's statusLine or a shell prompt: prints from
+                                 a local cache at once and refreshes it in the
+                                 background. VB_WALLET works in place of --wallet.
 
 ${c.bold("Everything else")}
   tools                          list what the agent exposes, live
@@ -568,6 +606,23 @@ async function main() {
       const q = argv.slice(1).filter((a) => !a.startsWith("--")).join(" ").trim();
       if (!q) return usageError('ask needs a question, in quotes');
       return cmdAsk(q);
+    }
+    case "statusline": {
+      // Only its own options, and no positional argument: anything else would
+      // be ignored without a word, which is the rule this tool refuses. The
+      // problem is said on the one line a status bar shows, not as the full
+      // help, which a bar would print row by row.
+      const lineError = (msg) => {
+        console.log(`VaultBags | ${msg}`);
+        return 2;
+      };
+      for (const a of argv.slice(1)) {
+        if (a === "--refresh" || /^--wallet=/.test(a)) continue;
+        return lineError(a.startsWith("-") ? `statusline: unknown option ${t(a.split("=")[0])}` : "statusline takes no argument; give the wallet as --wallet=<address>");
+      }
+      const wallet = (params.wallet ?? process.env.VB_WALLET ?? "").trim();
+      if (wallet && !isWalletAddress(wallet)) return lineError("--wallet must be a Solana address (a public address, never a key)");
+      return cmdStatusline(wallet || null, argv.includes("--refresh"));
     }
     case "tools":
       return cmdTools();

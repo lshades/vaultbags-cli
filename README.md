@@ -70,6 +70,35 @@ vaultbags brain-vs-flat   # the daily line vs a fixed even split, win or lose
 vaultbags ask "how much has been paid to holders?"
 ```
 
+## Status line
+
+One line about your vault, for Claude Code's status line or a shell prompt:
+
+```
+VaultBags | to claim: 0.0007 g gold, 0.0001 SPY shares, 0.0995 USDY ($0.30) | vault $1,208.28 | buying 30/35/35 today | next run in 4m
+```
+
+What the wallet has waiting to be claimed, in real units (grams of gold, SPY shares, USDY), the vault's total, today's buy and when the agent runs next. Without a wallet it shows the vault alone. The wallet is a public address; nothing here needs or accepts a key.
+
+```bash
+npm i -g vaultbags-cli
+vaultbags statusline --wallet=<your address>     # or set VB_WALLET
+```
+
+In Claude Code, add it to `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "vaultbags statusline --wallet=<your address>",
+    "refreshInterval": 60
+  }
+}
+```
+
+It prints from a local cache at once (about 70 ms) and refreshes that cache in the background, so the bar never waits on the network: the vault's figures are read at most every five minutes and the wallet's at most every fifteen (the public claim preview allows 200 reads a day per address). A figure that could not be read is left out, never shown as zero, and a line read more than an hour ago says when. `refreshInterval` keeps the countdown current while a session is idle. Installing it globally matters here: `npx` resolves the package on every run, which measured 1.1 to 1.5 s against 70 ms.
+
 ## Everything else
 
 ```bash
