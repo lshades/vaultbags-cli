@@ -31,6 +31,11 @@ const SEP = " | ";
 
 const finite = (n) => n != null && Number.isFinite(Number(n));
 const positive = (n) => finite(n) && Number(n) > 0;
+// A stored time more than this far ahead of the clock (the clock was set back,
+// or the file was edited) is no time at all: kept, it would hold every refresh
+// off until the clock caught up.
+export const FUTURE_SLACK_MS = 5 * 60 * 1000;
+const past = (x, nowMs) => (finite(x) && Number(x) <= nowMs + FUTURE_SLACK_MS ? Number(x) : null);
 
 export const isWalletAddress = (s) => typeof s === "string" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(s);
 
@@ -116,7 +121,7 @@ export function statusLineText(cache, { wallet = null, nowMs = Date.now() } = {}
   // is due reads as due, not as running.
   const run = nextRun(nowMs);
   parts.push(run.running ? "agent run due" : `next run in ${run.minutes}m`);
-  const oldest = [v?.at, wallet ? w?.at : null].filter(finite);
+  const oldest = [past(v?.at, nowMs), wallet ? past(w?.at, nowMs) : null].filter(finite);
   if (!v && !w?.preview) parts.push(cache?.failedAt ? "could not be read" : "reading...");
   else if (oldest.length && nowMs - Math.min(...oldest) > SHOW_AGE_AFTER_MS) parts.push(ageText(Math.min(...oldest), nowMs));
   return parts.join(SEP);
@@ -126,7 +131,7 @@ export function statusLineText(cache, { wallet = null, nowMs = Date.now() } = {}
 // not, is too: a read that keeps failing is tried on the same schedule, never
 // on every run of the line.
 const dueBy = (at, triedAt, ttl, nowMs) => {
-  const last = Math.max(finite(at) ? Number(at) : -Infinity, finite(triedAt) ? Number(triedAt) : -Infinity);
+  const last = Math.max(past(at, nowMs) ?? -Infinity, past(triedAt, nowMs) ?? -Infinity);
   return nowMs - last >= ttl;
 };
 
@@ -136,7 +141,8 @@ export function dueParts(cache, { wallet = null, nowMs = Date.now() } = {}) {
   let mine = false;
   if (wallet) {
     const w = sameWallet(cache?.wallet, wallet) ? cache.wallet : null;
-    const waitUntil = finite(w?.retryAfter) ? w.retryAfter : 0;
+    // A wait is at most the backoff from now; a longer one is a clock set back.
+    const waitUntil = finite(w?.retryAfter) && Number(w.retryAfter) <= nowMs + WALLET_BACKOFF_MS + FUTURE_SLACK_MS ? Number(w.retryAfter) : 0;
     const tried = cache?.tried?.walletId === walletId(wallet) ? cache.tried.wallet : null;
     mine = nowMs >= waitUntil && dueBy(w?.at, tried, WALLET_TTL_MS, nowMs);
   }

@@ -19,7 +19,7 @@ import { verifyClaim, verifyAllocation, verifyStrategy, verifyReport, verifyRese
 import { apiGet, apiPost, base, HttpError, DEFAULT_RPC, terminalSafe } from "../src/io.js";
 import { spawn } from "node:child_process";
 import { isWalletAddress, cacheKey, statusLineText, dueParts, refreshCache } from "../src/statusline.js";
-import { readCache, writeCache, isLocked, tryLock, releaseLock } from "../src/statuslineCache.js";
+import { readCache, writeCache, isLocked, tryLock, releaseLock, ownDir } from "../src/statuslineCache.js";
 
 // Every value that came from the API or the chain passes through this before a
 // person reads it (see terminalSafe): the colors are this tool's own, applied
@@ -251,14 +251,25 @@ async function cmdStatusline(wallet, refresh) {
     }
     return 0;
   }
+  // With no folder only this user can open, there is nowhere to keep what a
+  // refresh reads: said once, rather than "reading..." for good.
+  if (!ownDir()) {
+    console.log("VaultBags | cache unavailable: no folder only this user can open (temp or ~/.cache)");
+    return 0;
+  }
   const cache = readCache(key);
   console.log(statusLineText(cache, { wallet, nowMs: Date.now() }));
   const due = dueParts(cache, { wallet, nowMs: Date.now() });
   if ((due.vault || due.wallet) && !isLocked(key)) {
-    const args = [fileURLToPath(import.meta.url), "statusline", "--refresh", ...(wallet ? [`--wallet=${wallet}`] : [])];
+    // The wallet goes to the refresh in its environment, never on its command
+    // line, which any account on the machine can list.
+    const args = [fileURLToPath(import.meta.url), "statusline", "--refresh"];
+    const env = { ...process.env };
+    if (wallet) env.VB_WALLET = wallet;
+    else delete env.VB_WALLET;
     // A refresh that cannot start (no node to run, no process to spare) only
     // means the next line is printed from the same cache: never a crash here.
-    const child = spawn(process.execPath, args, { detached: true, stdio: "ignore", windowsHide: true });
+    const child = spawn(process.execPath, args, { detached: true, stdio: "ignore", windowsHide: true, env });
     child.on("error", () => {});
     child.unref();
   }

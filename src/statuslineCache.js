@@ -15,7 +15,7 @@
 
 import { randomBytes, createHash } from "node:crypto";
 import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
-import { tmpdir, userInfo } from "node:os";
+import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 
 export const LOCK_STALE_MS = 60 * 1000;
@@ -34,10 +34,18 @@ function userTag() {
   return createHash("sha256").update(name).digest("hex").slice(0, 12);
 }
 export const cacheDir = () => join(tmpdir(), `vaultbags-statusline-${userTag()}`);
+// Where the cache goes when the temp folder's one is not this user's alone
+// (another account made it first on a shared machine): a folder under the
+// user's own runtime or cache directory, which nobody else can create.
+export const fallbackDir = () =>
+  process.env.XDG_RUNTIME_DIR ? join(process.env.XDG_RUNTIME_DIR, "vaultbags-statusline") : join(homedir(), ".cache", "vaultbags-statusline");
 
-/** The folder, made if missing; null when it is not one only this user can open. */
+/** The folder, made if missing; null when neither is one only this user can open. */
 export function ownDir() {
-  const dir = cacheDir();
+  return ownedDir(cacheDir()) || ownedDir(fallbackDir());
+}
+
+function ownedDir(dir) {
   try {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     const st = lstatSync(dir);

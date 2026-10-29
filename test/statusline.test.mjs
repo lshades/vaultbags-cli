@@ -243,3 +243,49 @@ test("on disk: a folder of the user's own, a whole file, and only its own lock r
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("a stored time far ahead of the clock does not hold refreshes off", () => {
+  const now = Date.UTC(2026, 9, 29, 12, 0, 0);
+  const ahead = now + 24 * 3600 * 1000;
+  assert.equal(dueParts({ vault: { at: ahead }, tried: { vault: ahead } }, { nowMs: now }).vault, true, "a vault read dated tomorrow is due");
+  assert.equal(dueParts({ vault: { at: now - 1000 } }, { nowMs: now }).vault, false, "a fresh one is not");
+});
+
+test("the cache falls back to the user's own folder when the temp one is not theirs", async () => {
+  const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const os = await import("node:os");
+  const root = mkdtempSync(join(os.tmpdir(), "vb-statusline-fallback-"));
+  const tmp = join(root, "tmp");
+  const runtime = join(root, "runtime");
+  const env = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR };
+  try {
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(tmp);
+    mkdirSync(runtime);
+    process.env.TMPDIR = process.env.TEMP = process.env.TMP = tmp;
+    process.env.XDG_RUNTIME_DIR = runtime;
+    const c = await import("../src/statuslineCache.js?fallback" + Date.now());
+    // Something that is not this user's folder sits where the cache goes.
+    writeFileSync(c.cacheDir(), "taken");
+    const dir = c.ownDir();
+    assert.ok(dir && dir.startsWith(runtime), "the fallback folder is used");
+    assert.equal(c.writeCache("k", { vault: { at: 1 } }), true);
+    assert.equal(c.readCache("k").vault.at, 1, "and it works as the cache");
+  } finally {
+    for (const [k, v] of Object.entries(env)) {
+      if (v == null) delete process.env[k];
+      else process.env[k] = v;
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the wallet reaches the background refresh in its environment, not its command line", async () => {
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("../bin/vaultbags.js", import.meta.url), "utf8");
+  const body = src.slice(src.indexOf("async function cmdStatusline"), src.indexOf("// --- discovery"));
+  assert.ok(!body.includes("--wallet=${wallet}"), "no --wallet= on the child's arguments");
+  assert.ok(body.includes("env.VB_WALLET = wallet") && body.includes("delete env.VB_WALLET") && body.includes("windowsHide: true, env }"), "the child gets it, or none, in its environment");
+  assert.ok(body.includes("if (!ownDir())"), "and a missing private folder is said, not read forever");
+});
