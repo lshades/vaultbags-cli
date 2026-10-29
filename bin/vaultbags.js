@@ -226,23 +226,41 @@ async function cmdAsk(question) {
 // next run shows the new figures: Claude Code cancels a status line that is
 // still running when the next update arrives, so this one never waits.
 
+// A key or a seed phrase where the status line expected an address: said on
+// the one line a status bar shows (the full refusal is several lines, which a
+// bar would print row by row), with the two things that matter: what to give
+// instead, and that what was given is burned.
+function statuslineRefusal() {
+  console.log("VaultBags | refused: that looks like a private key or seed phrase, not an address. Give a public address (--wallet= or VB_WALLET); if it was real, move the funds to a new wallet");
+  return 2;
+}
+
 async function cmdStatusline(wallet, refresh) {
   const key = cacheKey(base(), wallet);
-  const cache = readCache(key);
   if (refresh) {
-    if (!tryLock(key)) return 0;
+    const token = tryLock(key);
+    if (!token) return 0;
     try {
-      writeCache(key, await refreshCache(cache, { wallet, nowMs: Date.now(), get: (path) => apiGet(path, V) }));
+      // Read under the lock: a refresh that finished a moment ago may already
+      // have done what this one was started for.
+      const cache = readCache(key);
+      const due = dueParts(cache, { wallet, nowMs: Date.now() });
+      if (due.vault || due.wallet) writeCache(key, await refreshCache(cache, { wallet, nowMs: Date.now(), get: (path) => apiGet(path, V) }));
     } finally {
-      releaseLock(key);
+      releaseLock(key, token);
     }
     return 0;
   }
+  const cache = readCache(key);
   console.log(statusLineText(cache, { wallet, nowMs: Date.now() }));
   const due = dueParts(cache, { wallet, nowMs: Date.now() });
   if ((due.vault || due.wallet) && !isLocked(key)) {
     const args = [fileURLToPath(import.meta.url), "statusline", "--refresh", ...(wallet ? [`--wallet=${wallet}`] : [])];
-    spawn(process.execPath, args, { detached: true, stdio: "ignore", windowsHide: true }).unref();
+    // A refresh that cannot start (no node to run, no process to spare) only
+    // means the next line is printed from the same cache: never a crash here.
+    const child = spawn(process.execPath, args, { detached: true, stdio: "ignore", windowsHide: true });
+    child.on("error", () => {});
+    child.unref();
   }
   return 0;
 }
@@ -481,6 +499,7 @@ async function main() {
   // The refusal runs before anything else, including help, so a mistyped paste
   // is caught by the first thing that reads it.
   const refusal = refuseSecretArgs(argv, { signatureArgs: [...signatureArgs, ...knownStrategyArgs] });
+  if (refusal.refuse && cmd === "statusline") return statuslineRefusal();
   if (refusal.refuse) {
     console.error(c.red(c.bold("Refused.")) + " " + refusal.reason);
     for (const line of REFUSAL_ADVICE) console.error(c.dim("  " + line));
@@ -500,7 +519,9 @@ async function main() {
   // almost certainly put there by another project, and refusing to run a
   // read-only command over it would break the tool for the people most likely
   // to use it while protecting nobody.
-  const envWarning = warnSecretEnv(process.env);
+  // Not on the status line, which runs on every event of a session: the same
+  // warning would repeat under the bar all day.
+  const envWarning = cmd === "statusline" ? { warn: false } : warnSecretEnv(process.env);
   if (envWarning.warn) console.error(c.yellow(envWarning.reason));
 
   if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
@@ -621,7 +642,10 @@ async function main() {
         return lineError(a.startsWith("-") ? `statusline: unknown option ${t(a.split("=")[0])}` : "statusline takes no argument; give the wallet as --wallet=<address>");
       }
       const wallet = (params.wallet ?? process.env.VB_WALLET ?? "").trim();
-      if (wallet && !isWalletAddress(wallet)) return lineError("--wallet must be a Solana address (a public address, never a key)");
+      // VB_WALLET is read here and nowhere else, so it is judged like an
+      // argument: a key or a seed phrase put there is refused, never sent.
+      if (params.wallet == null && wallet && refuseSecretArgs([wallet]).refuse) return statuslineRefusal();
+      if (wallet && !isWalletAddress(wallet)) return lineError("the wallet (--wallet= or VB_WALLET) must be a public Solana address, never a key");
       return cmdStatusline(wallet || null, argv.includes("--refresh"));
     }
     case "tools":

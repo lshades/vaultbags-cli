@@ -198,10 +198,11 @@ export function refuseSecretArgs(argv = [], { signatureArgs = [] } = {}) {
 // The distinction is who offered what. An argument is something the user typed
 // at this tool, so it gets refused. An environment variable is something that
 // was already there, usually belonging to another project entirely, and this
-// tool never reads it: nothing here touches process.env beyond VB_BASE, VB_RPC
-// and NO_COLOR. Blocking on it would protect nobody while making a read-only
-// command unusable on any machine that does Solana work, which is most of the
-// machines that would run this.
+// tool never reads it: nothing here touches process.env beyond VB_BASE, VB_RPC,
+// NO_COLOR and VB_WALLET (the status line's address, which is judged like an
+// argument and refused when it holds a key). Blocking on the rest would protect
+// nobody while making a read-only command unusable on any machine that does
+// Solana work, which is most of the machines that would run this.
 export function warnSecretEnv(env = {}) {
   for (const name of Object.keys(env)) {
     if (SECRET_ENV.test(name) && String(env[name] || "").trim()) {

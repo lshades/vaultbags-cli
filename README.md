@@ -75,10 +75,10 @@ vaultbags ask "how much has been paid to holders?"
 One line about your vault, for Claude Code's status line or a shell prompt:
 
 ```
-VaultBags | to claim: 0.0007 g gold, 0.0001 SPY shares, 0.0995 USDY ($0.30) | vault $1,208.28 | buying 30/35/35 today | next run in 4m
+VaultBags | to claim: 0.0007 g gold, 0.0001 SPY shares, 0.0995 USDY ($0.30) | vault $1,208.28 | buying 30/35/35 today (UTC) | next purchase 44% queued | next run in 4m
 ```
 
-What the wallet has waiting to be claimed, in real units (grams of gold, SPY shares, USDY), the vault's total, today's buy and when the agent runs next. Without a wallet it shows the vault alone. The wallet is a public address; nothing here needs or accepts a key.
+What the wallet has waiting to be claimed, in real units (grams of gold, SPY shares, USDY), the vault's total, today's buy (by the UTC day), how close the next purchase is and when the agent runs next. Without a wallet it shows the vault alone. The wallet is a public address; nothing here needs or accepts a key.
 
 ```bash
 npm i -g vaultbags-cli
@@ -97,7 +97,7 @@ In Claude Code, add it to `~/.claude/settings.json`:
 }
 ```
 
-It prints from a local cache at once (about 70 ms) and refreshes that cache in the background, so the bar never waits on the network: the vault's figures are read at most every five minutes and the wallet's at most every fifteen (the public claim preview allows 200 reads a day per address). A figure that could not be read is left out, never shown as zero, and a line read more than an hour ago says when. `refreshInterval` keeps the countdown current while a session is idle. Installing it globally matters here: `npx` resolves the package on every run, which measured 1.1 to 1.5 s against 70 ms.
+It prints from a local cache and refreshes that cache in the background, so the bar never waits on the network: the vault's figures are read at most every five minutes and the wallet's at most every fifteen (the public claim preview allows 200 reads a day per IP, shared by everything on the same network), a read that fails waits the same before it is tried again, and a refused one an hour. A figure that could not be read is left out, never shown as zero, and a line read more than an hour ago says when. The cache lives in a folder of your own under the system's temp folder and keeps a hash of the address, not the address. `refreshInterval` keeps the countdown current while a session is idle. Installing it globally matters here: measured on one machine, a run took about 70 ms installed and 1.1 to 1.5 s through `npx`, which resolves the package every time.
 
 ## Everything else
 
